@@ -13,6 +13,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from . import yuancut_ext as _ext
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
@@ -124,7 +125,9 @@ def _prefetch_tags(locale: str) -> bytes:
     return tags
 
 
-def _html_response(path: Path, extra_head: bytes = b"") -> web.StreamResponse:
+def _html_response(
+    path: Path, extra_head: bytes = b"", extra_body: bytes = b""
+) -> web.StreamResponse:
     try:
         body = path.read_bytes()
     except OSError:
@@ -132,6 +135,8 @@ def _html_response(path: Path, extra_head: bytes = b"") -> web.StreamResponse:
 
     if extra_head and b"</head>" in body:
         body = body.replace(b"</head>", extra_head + b"</head>", 1)
+    if extra_body and b"</body>" in body:
+        body = body.replace(b"</body>", extra_body + b"</body>", 1)
 
     headers = _headers_for(path)
     headers["Content-Type"] = "text/html; charset=utf-8"
@@ -141,6 +146,9 @@ def _html_response(path: Path, extra_head: bytes = b"") -> web.StreamResponse:
 def _page_response(path: Path) -> web.StreamResponse:
     if path.name == "index.html" and path.parent.name == "projects":
         return _html_response(path, _prefetch_tags(path.parent.parent.name))
+    if path.name == "index.html" and path.parent.name == "editor":
+        # 可选扩展的前端脚本（扩展不存在时是空字节，注入等于没做）
+        return _html_response(path, b"", _ext.script_tag())
     return _file_response(path)
 
 
@@ -224,10 +232,21 @@ try:
 
     yuancut_transcribe.register_routes(_routes)
 
+    # 可选扩展：接口由扩展自己注册，静态文件走 /yuancut/ext/<path>
+    _routes.get("/yuancut/ext/{path:.*}")(_ext.handle_static)
+    _ext.register_routes(_routes)
+
+    # Turbopack 打包的 Web Worker 用 importScripts("origin + static/chunks/…") 加载分块，
+    # 而编辑器部署在 /yuancut/ 子路径下 → 那些分块在根路径会 404。
+    # 这里把 /static/chunks/* 指回 yuancut-ui 的 chunks 目录（只映射这一个前缀，
+    # 不碰 ComfyUI 自己的 /static/extensions 等）。
+    @_routes.get("/static/chunks/{path:.*}")
+    async def yuancut_worker_chunk(request):  # noqa: ANN001 - aiohttp handler
+        return _serve_relative(f"_next/static/chunks/{request.match_info.get('path', '')}")
+
     @_routes.get("/yuancut")
     async def yuancut_root(request):  # noqa: ANN001 - aiohttp handler
         return _serve_relative("")
-
     @_routes.get("/yuancut/{path:.*}")
     async def yuancut_static(request):  # noqa: ANN001 - aiohttp handler
         return _serve_relative(request.match_info.get("path", ""))

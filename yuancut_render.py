@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -84,6 +85,28 @@ async def _probe_streams(path: Path) -> set[str]:
     out, _ = await process.communicate()
     kinds = {line.strip() for line in (out or b"").decode().splitlines() if line.strip()}
     return kinds
+
+
+async def _probe_duration(path: Path) -> float:
+    """读容器时长（秒）。分段渲染要靠它判断这一段是不是被截断。"""
+    ffprobe = shutil.which("ffprobe") or "/usr/bin/ffprobe"
+    process = await asyncio.create_subprocess_exec(
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nw=1:nk=1",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await process.communicate()
+    try:
+        return float((out or b"0").decode().strip() or 0.0)
+    except ValueError:
+        return 0.0
 
 
 def _asset_path(asset_id: str) -> Path | None:
@@ -184,6 +207,68 @@ def _audio_tempo_filter(rate: float, *, keep_pitch: bool) -> str:
     return ",".join(chain)
 
 
+AUDIO_RATE = 48000
+
+
+def _audio_chain(
+    tracks: list[dict], inputs: dict[str, int], caps: dict[str, set[str]]
+) -> tuple[list[str], str]:
+    """时间线的整条音轨滤镜链（只出音频，不出画面）。
+
+    预览是 WebAudio 把每段声音直接相加，所以这里也必须是「逐样本相加」：
+    统一重采样到 48 kHz → 各自的 trim/变速/音量/延时 → amix(normalize=0)。
+    整条时间线一次算完、一次编码，避免分段各自编码 AAC 再拼接。
+    """
+    parts: list[str] = []
+    labels: list[str] = []
+    index = 0
+    for track in tracks:
+        for element in track.get("elements") or []:
+            if element.get("type") not in ("video", "audio"):
+                continue
+            if element.get("hidden") or element.get("muted"):
+                continue
+            asset_id = element.get("assetId")
+            stream = inputs.get(asset_id) if asset_id else None
+            if stream is None:
+                continue
+            if "audio" not in caps.get(asset_id, set()):
+                continue
+            start = _num(element.get("start"))
+            length = _num(element.get("duration"))
+            trim_start = _num(element.get("trimStart"))
+            volume = _num(element.get("volume"), 1.0)
+            if length <= 0:
+                continue
+            label = f"a{index}"
+            # 变速：源取 length*rate 秒再时间伸缩回 length 秒；默认保音高（不变调）
+            rate = _element_rate(element)
+            source_length = length * rate if rate != 1.0 else length
+            tempo = _audio_tempo_filter(
+                rate, keep_pitch=_element_keeps_pitch(element)
+            )
+            delay = int(round(start * 1000))
+            parts.append(
+                f"[{stream}:a]atrim=start={trim_start:.3f}:duration={source_length:.3f},"
+                f"asetpts=PTS-STARTPTS,aresample={AUDIO_RATE},"
+                f"{tempo + ',' if tempo else ''}"
+                f"volume={volume:.3f},"
+                f"adelay=delays={delay}:all=1[{label}]"
+            )
+            labels.append(f"[{label}]")
+            index += 1
+
+    if not labels:
+        return [], ""
+    parts.append(
+        "".join(labels)
+        + f"amix=inputs={len(labels)}:duration=longest:normalize=0,"
+        + f"aformat=sample_fmts=fltp:sample_rates={AUDIO_RATE}:channel_layouts=stereo"
+        + "[aout]"
+    )
+    return parts, "aout"
+
+
 # --------------------------------------------------------------- filter 编译
 class CompileError(Exception):
     pass
@@ -194,12 +279,23 @@ def _build_filter(
     inputs: dict[str, int],
     caps: dict[str, set[str]],
     output_size: tuple[int, int] | None = None,
+    include_audio: bool = True,
 ) -> tuple[str, str, str]:
     """返回 (filter_complex, video_out_label, audio_out_label)。"""
     canvas = timeline.get("canvas") or {}
-    width = int(canvas.get("width") or 1920)
-    height = int(canvas.get("height") or 1080)
+    canvas_w = int(canvas.get("width") or 1920)
+    canvas_h = int(canvas.get("height") or 1080)
     fps = int(timeline.get("fps") or 30)
+
+    # 直接按「输出分辨率」合成：素材、文字、位置都一次性缩放到目标分辨率，
+    # 避免「先按画布 960x544 合成、最后整体拉大到 2K」造成的画质损失。
+    if output_size:
+        width, height = int(output_size[0]), int(output_size[1])
+    else:
+        width, height = canvas_w, canvas_h
+    # 画布坐标 → 输出坐标 的换算系数（位置/字号按这个等比放大）
+    sxs = width / max(1, canvas_w)
+    sys_ = height / max(1, canvas_h)
     duration = _num(timeline.get("duration"), 0)
 
     parts: list[str] = []
@@ -267,15 +363,30 @@ def _build_filter(
                 )
             else:
                 timing = f"setpts=PTS-STARTPTS+{start:.3f}/TB"
+            # 先把素材按画布「铺满再居中裁切」（与预览的 cover 一致），
+            # 再套用户的 transform 缩放。之前只做 transform 缩放，
+            # 素材原始尺寸和画布不一致时就会被 overlay 裁掉/缩小。
             parts.append(
                 f"[{stream}:v]trim=start={trim_start:.3f}:duration={source_length:.3f},"
                 f"{timing},"
-                f"scale=iw*{scale:.4f}:ih*{scale:.4f},format=rgba,"
+                # 与预览一致：按「适应画面」缩放（不裁切），黑边由底图透出来；
+                # 之前用 increase+crop 是「铺满裁切」，素材比例和画布不同时就会
+                # 看起来被放大/裁掉一截。
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                # 上面的 scale 已经把素材「适应」到输出尺寸，这里的 transform.scale
+                # 只是在输出像素上再乘一次；再乘 sxs/sys_ 会把缩放算两遍
+                # （画布 ≠ 输出时，例如 2560x1440 画布导出 1080p，等于又缩 0.75）。
+                + (
+                    ""
+                    if abs(scale - 1.0) < 0.001
+                    else f"scale=iw*{scale:.4f}:ih*{scale:.4f},"
+                )
+                + "format=rgba,"
                 f"colorchannelmixer=aa={opacity:.3f}[{label}]"
             )
             parts.append(
                 f"[{current}][{label}]overlay="
-                f"x=(W-w)/2+{pos_x:.1f}:y=(H-h)/2+{pos_y:.1f}"
+                f"x=(W-w)/2+{pos_x * sxs:.1f}:y=(H-h)/2+{pos_y * sys_:.1f}"
                 f":eof_action=pass:enable='between(t,{start:.3f},{start + length:.3f})'"
                 f"[o{index}]"
             )
@@ -309,8 +420,8 @@ def _build_filter(
             color = str(element.get("color") or "#ffffff")
             if not color.startswith("#"):
                 color = "#ffffff"
-            pos_x = int(width / 2 + _num(element.get("x")))
-            pos_y = int(height / 2 + _num(element.get("y")))
+            pos_x = int(width / 2 + _num(element.get("x")) * sxs)
+            pos_y = int(height / 2 + _num(element.get("y")) * sys_)
             # 文本块垂直夹紧，保证不出画面
             block_height = font_size * 1.3 * len(lines)
             if block_height * 2 <= height:
@@ -331,61 +442,15 @@ def _build_filter(
             current = f"t{text_index}"
             text_index += 1
 
-    # 音频：每段素材音轨单独 trim/延迟，最后 amix
-    audio_labels: list[str] = []
-    audio_index = 0
-    for track in tracks:
-        for element in track.get("elements") or []:
-            if element.get("type") not in ("video", "audio"):
-                continue
-            if element.get("hidden") or element.get("muted"):
-                continue
-            asset_id = element.get("assetId")
-            stream = inputs.get(asset_id) if asset_id else None
-            if stream is None:
-                continue
-            if "audio" not in caps.get(asset_id, set()):
-                continue
-            start = _num(element.get("start"))
-            length = _num(element.get("duration"))
-            trim_start = _num(element.get("trimStart"))
-            volume = _num(element.get("volume"), 1.0)
-            if length <= 0:
-                continue
-            label = f"a{audio_index}"
-            # 变速：源取 length*rate 秒再时间伸缩回 length 秒；默认保音高（不变调）
-            rate = _element_rate(element)
-            source_length = length * rate if rate != 1.0 else length
-            tempo = _audio_tempo_filter(
-                rate, keep_pitch=_element_keeps_pitch(element)
-            )
-            parts.append(
-                f"[{stream}:a]atrim=start={trim_start:.3f}:duration={source_length:.3f},"
-                f"asetpts=PTS-STARTPTS,"
-                f"{tempo + ',' if tempo else ''}"
-                f"volume={volume:.3f},"
-                f"adelay={int(start * 1000)}|{int(start * 1000)}[{label}]"
-            )
-            audio_labels.append(f"[{label}]")
-            audio_index += 1
-
-    if output_size is not None and output_size != (width, height):
-        out_w, out_h = output_size
-        parts.append(
-            f"[{current}]scale={out_w}:{out_h}:flags=lanczos,format=yuv420p[scaled]"
-        )
-        current = "scaled"
+    # 合成已经是输出尺寸，这里只统一像素格式（不再做二次放大）
+    parts.append(f"[{current}]setsar=1,format=yuv420p[scaled]")
+    current = "scaled"
 
     video_out = current
-    if audio_labels:
-        parts.append(
-            "".join(audio_labels)
-            + f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0[aout]"
-        )
-        audio_out = "aout"
-    else:
-        parts.append("anullsrc=r=48000:cl=stereo[asilence]")
-        audio_out = "asilence"
+    audio_out = ""
+    if include_audio:
+        audio_parts, audio_out = _audio_chain(tracks, inputs, caps)
+        parts.extend(audio_parts)
     return ";".join(parts), video_out, audio_out
 
 
@@ -441,13 +506,13 @@ def _write_text_file(text: str) -> str:
     return handle.name.replace("\\", "/").replace(":", "\\\\:")
 
 
-async def _run_render(
-    timeline: dict, work: Path | None = None, job: dict | None = None
-) -> tuple[Path | None, str | None]:
-    ffmpeg = _ffmpeg_binary()
-    if not ffmpeg:
-        return None, "本机找不到 ffmpeg"
+async def _prepare_inputs(
+    timeline: dict,
+) -> tuple[dict[str, int], list[str], dict[str, set[str]]] | str:
+    """把时间线用到的素材摊成 ffmpeg 的 -i 参数，并探测每条流。
 
+    返回 str 表示出错（消息直接给用户看）。
+    """
     assets: list[str] = []
     for track in timeline.get("tracks") or []:
         for element in track.get("elements") or []:
@@ -457,18 +522,35 @@ async def _run_render(
 
     inputs: dict[str, int] = {}
     input_args: list[str] = []
+    paths: dict[str, Path] = {}
     for asset_id in assets:
         path = _asset_path(asset_id)
         if path is None:
-            return None, f"素材未上传：{asset_id}"
+            return f"素材未上传：{asset_id}"
         inputs[asset_id] = len(inputs)
         input_args += ["-i", str(path)]
+        paths[asset_id] = path
 
     caps: dict[str, set[str]] = {}
-    for asset_id in assets:
-        path = _asset_path(asset_id)
-        if path is not None:
-            caps[asset_id] = await _probe_streams(path)
+    for asset_id, path in paths.items():
+        caps[asset_id] = await _probe_streams(path)
+    return inputs, input_args, caps
+
+async def _run_render_once(
+    timeline: dict,
+    work: Path | None = None,
+    job: dict | None = None,
+    progress_window: tuple[float, float] = (0.0, 1.0),
+    include_audio: bool = True,
+) -> tuple[Path | None, str | None]:
+    ffmpeg = _ffmpeg_binary()
+    if not ffmpeg:
+        return None, "本机找不到 ffmpeg"
+
+    prepared = await _prepare_inputs(timeline)
+    if isinstance(prepared, str):
+        return None, prepared
+    inputs, input_args, caps = prepared
 
     canvas = timeline.get("canvas") or {}
     width = int(canvas.get("width") or 1920)
@@ -479,7 +561,7 @@ async def _run_render(
 
     try:
         filter_complex, video_out, audio_out = _build_filter(
-            timeline, inputs, caps, (out_w, out_h)
+            timeline, inputs, caps, (out_w, out_h), include_audio=include_audio
         )
     except CompileError as exc:
         return None, str(exc)
@@ -507,6 +589,22 @@ async def _run_render(
             pass
     total_frames = max(1, int(duration * fps))
 
+    # 分段渲染已经把内存按「片长」切开了，这里不再限制滤镜/编码线程，
+    # 让 ffmpeg 吃满 CPU（之前为了压内存串行化，速度掉得厉害）。
+    # 编码参数：NVENC 用 p5/vbr/cq，libx264 用 preset/crf
+    # 没显式指定编码器时，有 NVENC 就默认走硬件编码（RTX 30 系实测可用）
+    _vcodec = str(profile.get("vcodec") or "libx264")
+    if "nvenc" in _vcodec:
+        _encoder_args = [
+            "-preset", "p5", "-tune", "hq", "-rc", "vbr",
+            "-cq", str(int(profile.get("crf") or 19) * 2), "-b:v", "0",
+        ]
+    else:
+        _encoder_args = [
+            "-preset", str(profile.get("preset") or "veryfast"),
+            "-crf", str(int(profile.get("crf") or 19)),
+        ]
+
     args = [
         ffmpeg,
         "-hide_banner",
@@ -518,22 +616,19 @@ async def _run_render(
         filter_complex,
         "-map",
         f"[{video_out}]",
-        "-map",
-        f"[{audio_out}]",
+        *(
+            ["-map", f"[{audio_out}]", "-c:a", "aac", "-ar", str(AUDIO_RATE),
+             "-b:a", str(profile.get("audioBitrate") or "192k")]
+            if audio_out
+            else ["-an"]
+        ),
         "-c:v",
-        str(profile.get("vcodec") or "libx264"),
-        "-preset",
-        str(profile.get("preset") or "veryfast"),
-        "-crf",
-        str(int(profile.get("crf") or 19)),
+        _vcodec,
+        *_encoder_args,
         "-pix_fmt",
         "yuv420p",
         "-threads",
         str(int(profile.get("threads") or 0)),
-        "-c:a",
-        "aac",
-        "-b:a",
-        str(profile.get("audioBitrate") or "192k"),
         "-t",
         f"{duration:.3f}",
         "-movflags",
@@ -558,35 +653,30 @@ async def _run_render(
                     done_frames = int(line.split("=", 1)[1])
                 except ValueError:
                     continue
-                job["progress"] = min(0.98, done_frames / total_frames)
+                ratio = min(0.99, done_frames / total_frames)
+                base, span = progress_window
+                job["progress"] = min(0.985, base + ratio * span)
         return b""
 
     assert process.stderr is not None
     _, stderr = await asyncio.gather(_drain_progress(), process.stderr.read())
+    await process.wait()  # 不 wait 的话 returncode 还是 None，会被误判成失败
     detail = (stderr or b"").decode("utf-8", "replace").strip()
     produced = output.is_file() and output.stat().st_size > 0
 
     if process.returncode != 0 or not produced:
-        # 有些情况下 ffmpeg 收尾阶段被杀（内存/磁盘），但文件其实已经写完：
-        # 只要能读到有效文件就按成功处理，只记警告，不再让整次导出白跑。
-        if produced:
-            logger.warning(
-                "[YuanCut] ffmpeg 返回码 %s，但产物已生成（%d 字节），按成功处理。stderr: %s",
-                process.returncode,
-                output.stat().st_size,
-                detail[-600:] or "(空)",
-            )
-        else:
-            logger.error(
-                "[YuanCut] ffmpeg 渲染失败 rc=%s stderr=%s",
-                process.returncode,
-                detail[-1500:] or "(空)",
-            )
-            reason = detail[-600:] or (
-                f"ffmpeg 被异常终止（返回码 {process.returncode}），"
-                "stderr 为空，通常是内存或磁盘不足"
-            )
-            return None, f"ffmpeg 渲染失败：{reason}"
+        # 只有 returncode 明确为 0 且文件非空才算成功。以前「文件存在就算成功」
+        # 把被中途杀掉的短段也当成功，拼出比时间线短一半的成片。
+        logger.error(
+            "[YuanCut] ffmpeg 渲染失败 rc=%s stderr=%s",
+            process.returncode,
+            detail[-1500:] or "(空)",
+        )
+        reason = detail[-600:] or (
+            f"ffmpeg 被异常终止（返回码 {process.returncode}），"
+            "stderr 为空，通常是内存或磁盘不足"
+        )
+        return None, f"ffmpeg 渲染失败：{reason}"
 
     # 补 bt709 色彩标记（ffmpeg 滤镜链常丢 primaries/trc）
     fixed = output.with_name("fixed.mp4")
@@ -618,6 +708,231 @@ async def _run_render(
 
 
 # ------------------------------------------------------------------- handlers
+# ------------------------------- 分段（流式）渲染 -------------------------------
+# 一次把整条时间线塞进 ffmpeg：内存 = 轨道数 × 线程数 × 帧缓冲，长项目能到几十 GB。
+# 剪映的做法是单条流式管线；这里用「按 30 秒切片分别渲染 + concat 无损拼接」达到
+# 同样的内存曲线（每片渲染完就释放，峰值只跟片长有关，跟总时长/轨道数无关）。
+
+SEGMENT_SECONDS = 30.0
+
+
+def _segment_timeline(timeline: dict, start: float, length: float) -> dict:
+    """裁出 [start, start+length) 这段：时间平移、trim 前移、窗外片段丢弃。"""
+    tracks: list[dict] = []
+    for track in timeline.get("tracks") or []:
+        elements: list[dict] = []
+        for element in track.get("elements") or []:
+            element_start = _num(element.get("start"))
+            element_length = _num(element.get("duration"))
+            if element_length <= 0:
+                continue
+            window_end = start + length
+            if element_start + element_length <= start + 0.001 or element_start >= window_end - 0.001:
+                continue
+            keep_from = max(0.0, start - element_start)
+            local_length = min(element_start + element_length, window_end) - max(element_start, start)
+            if local_length <= 0.01:
+                continue
+            copy = dict(element)
+            copy["start"] = max(0.0, element_start - start)
+            copy["duration"] = local_length
+            if "trimStart" in element:
+                rate = _element_rate(element) if element.get("type") == "video" else 1.0
+                copy["trimStart"] = _num(element.get("trimStart")) + keep_from * rate
+            elements.append(copy)
+        tracks.append({**track, "elements": elements})
+    return {**timeline, "duration": length, "tracks": tracks}
+
+
+async def _concat_segments(files: list[Path], output: Path) -> str | None:
+    ffmpeg = _ffmpeg_binary()
+    if not ffmpeg:
+        return "本机找不到 ffmpeg"
+    listing = output.parent / "segments.txt"
+    listing.write_text(
+        "".join(f"file '{item.as_posix()}'\n" for item in files), encoding="utf-8"
+    )
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(listing),
+        "-c", "copy", "-movflags", "+faststart", str(output),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if not output.is_file():
+        return stderr.decode("utf-8", "replace")[-500:] or "concat 失败"
+    return None
+
+
+async def _render_audio_pass(
+    timeline: dict, work_dir: Path
+) -> tuple[Path | None, str | None]:
+    """把整条时间线的音频一次算成 48 kHz PCM。
+
+    这是「声音破音」的根治点：以前每 30 秒一段各自编码 AAC，再用
+    `concat -c copy` 拼起来 —— AAC 是带编码器状态/预热帧的有状态编码，
+    跨独立编码的码流拼接会让解码器从第二段开始报错（实测 60 s 内 800+ 次
+    「channel element not allocated」），听感就是全程破音、渣噪。
+    现在音频只在最后统一编码一次，段与段之间不存在任何接缝。
+    """
+    duration = _num(timeline.get("duration"), 0)
+    if duration <= 0:
+        return None, "时间线时长为 0"
+
+    prepared = await _prepare_inputs(timeline)
+    if isinstance(prepared, str):
+        return None, prepared
+    inputs, input_args, caps = prepared
+
+    audio_parts, audio_out = _audio_chain(timeline.get("tracks") or [], inputs, caps)
+    if not audio_out:
+        return None, None  # 没有声音轨，不用生成音频
+
+    ffmpeg = _ffmpeg_binary()
+    if not ffmpeg:
+        return None, "本机找不到 ffmpeg"
+
+    output = work_dir / "audio.wav"
+    args = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        *input_args,
+        "-filter_complex", ";".join(audio_parts),
+        "-map", f"[{audio_out}]",
+        "-c:a", "pcm_s16le",
+        "-ar", str(AUDIO_RATE),
+        "-ac", "2",
+        "-t", f"{duration:.3f}",
+        str(output),
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+    )
+    _, stderr = await process.communicate()
+    if not output.is_file() or output.stat().st_size == 0:
+        detail = (stderr or b"").decode("utf-8", "replace").strip()
+        return None, f"音频渲染失败：{detail[-500:] or 'ffmpeg 无输出'}"
+    return output, None
+
+
+async def _mux_audio(
+    video: Path,
+    audio: Path,
+    output: Path,
+    duration: float,
+    profile: dict,
+) -> str | None:
+    """把成片视频（已拼接、无音轨）和整条音频封装一次。"""
+    ffmpeg = _ffmpeg_binary()
+    if not ffmpeg:
+        return "本机找不到 ffmpeg"
+    args = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(video),
+        "-i", str(audio),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-ar", str(AUDIO_RATE),
+        "-b:a", str(profile.get("audioBitrate") or "192k"),
+        "-t", f"{duration:.3f}",
+        "-movflags", "+faststart",
+        str(output),
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+    )
+    _, stderr = await process.communicate()
+    if not output.is_file() or output.stat().st_size == 0:
+        detail = (stderr or b"").decode("utf-8", "replace").strip()
+        return detail[-500:] or "封装失败"
+    return None
+
+
+async def _run_render(
+    timeline: dict, work: Path | None = None, job: dict | None = None
+) -> tuple[Path | None, str | None]:
+    duration = _num(timeline.get("duration"), 0)
+    work_dir = work or Path(tempfile.mkdtemp(prefix="yuancut-render-"))
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) 音频：整条时间线一次算完（不分段、只编码一次 AAC）
+    audio_path, audio_error = await _render_audio_pass(timeline, work_dir)
+    if audio_error:
+        return None, audio_error
+
+    # 2) 画面：按 30 秒分段流式渲染（内存只跟片长有关），段内不处理音频
+    segments: list[Path] = []
+    index = 0
+    start = 0.0
+    total_segments = max(1, int(math.ceil(duration / SEGMENT_SECONDS)))
+    while start < duration - 0.01:
+        if job is not None and job.get("cancelled"):
+            return None, "已取消"
+        length = min(SEGMENT_SECONDS, duration - start)
+        piece = _segment_timeline(timeline, start, length)
+        piece["no_segment"] = True
+        piece_dir = work_dir / f"seg{index:03d}"
+        piece_dir.mkdir(parents=True, exist_ok=True)
+        # 分段渲染最怕「ffmpeg 被杀但文件还在」：以前按成功处理，
+        # 结果拼出来的成片比时间线短（535 s 的项目只剩 356 s）。
+        # 这里按容器时长校验，短了就单线程重试一次，还短就直接报错，绝不悄悄交付。
+        attempt = 0
+        while True:
+            path, error = await _run_render_once(
+                piece,
+                piece_dir,
+                job,
+                progress_window=(
+                    index / max(1, total_segments),
+                    1 / max(1, total_segments),
+                ),
+                include_audio=False,
+            )
+            if path is None:
+                return None, f"第 {index + 1} 段渲染失败：{error}"
+            produced = await _probe_duration(path)
+            if produced >= length - 0.35:
+                break
+            if attempt >= 1:
+                return None, (
+                    f"第 {index + 1} 段只渲染出 {produced:.2f}s / {length:.2f}s，"
+                    "ffmpeg 被中途终止（内存或磁盘不足），已停止导出"
+                )
+            logger.warning(
+                "[YuanCut] 第 %d 段只渲染出 %.2fs / %.2fs，单线程重试一次",
+                index + 1,
+                produced,
+                length,
+            )
+            attempt += 1
+            piece = {**piece, "profile": {**(piece.get("profile") or {}), "threads": 1}}
+        segments.append(path)
+        index += 1
+        start += length
+
+    silent = work_dir / "video.mp4"
+    error = await _concat_segments(segments, silent)
+    if error:
+        return None, f"分段拼接失败：{error}"
+    for item in segments:
+        try:
+            item.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # 3) 封装：视频流直接 copy，音频只在这里编码一次
+    output = work_dir / "out.mp4"
+    if audio_path is None:
+        silent.replace(output)
+        return output, None
+
+    profile = timeline.get("profile") or {}
+    error = await _mux_audio(silent, audio_path, output, duration, profile)
+    if error:
+        return None, f"音视频封装失败：{error}"
+    return output, None
+
+
 async def asset_begin(request: web.Request) -> web.Response:
     token = uuid.uuid4().hex
     work = Path(tempfile.mkdtemp(prefix="yuancut-asset-"))
