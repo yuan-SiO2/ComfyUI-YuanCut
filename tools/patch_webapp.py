@@ -8194,6 +8194,224 @@ if "VocalBeautifyRow" not in _vp:
     print(f"  patched {VIDEO_PANEL.relative_to(ROOT)} (视频人声美化)")
 
 
+# ------------------- 波形跟着裁剪走（只画 trim 窗口里的那一段）
+# 以前 AudioWaveform 把「整条素材」的波形压进片段宽度：一旦裁剪（trimStart/时长变了），
+# 波形和时间线就对不上——片段只剩素材中间 3 秒，波形却还是整条素材。
+# 这里由组件自己算窗口：内层按「素材时长 / 可见源时长」放宽，再按 trimStart 平移，
+# 外层 overflow-hidden 只露出片段这一窗，所有调用点都自动正确。
+AUDIO_WAVEFORM_FILE = SRC / "components" / "editor" / "panels" / "timeline" / "audio-waveform.tsx"
+AUDIO_WAVEFORM_FILE.write_text(
+    tabsify(
+        """
+import { useEffect, useMemo, useRef, useState } from "react";
+import WaveSurfer from "wavesurfer.js";
+
+interface AudioWaveformProps {
+	audioUrl?: string;
+	audioBlob?: Blob;
+	audioBuffer?: AudioBuffer;
+	/** 片段在时间线上的可见时长 */
+	duration?: number;
+	/** 片段从素材的第几秒开始（裁剪入点） */
+	trimStart?: number;
+	/** 变速倍率：可见源时长 = duration * playbackRate */
+	playbackRate?: number;
+	height?: number;
+	volume?: number;
+	className?: string;
+}
+
+function extractPeaks({
+	buffer,
+	length = 512,
+}: {
+	buffer: AudioBuffer;
+	length?: number;
+}): number[][] {
+	const channels = buffer.numberOfChannels;
+	const peaks: number[][] = [];
+
+	for (let c = 0; c < channels; c++) {
+		const data = buffer.getChannelData(c);
+		const step = Math.floor(data.length / length);
+		const channelPeaks: number[] = [];
+
+		for (let i = 0; i < length; i++) {
+			const start = i * step;
+			const end = Math.min(start + step, data.length);
+			let max = 0;
+			for (let j = start; j < end; j++) {
+				const abs = Math.abs(data[j]);
+				if (abs > max) max = abs;
+			}
+			channelPeaks.push(max);
+		}
+		peaks.push(channelPeaks);
+	}
+
+	return peaks;
+}
+
+export function AudioWaveform({
+	audioUrl,
+	audioBlob,
+	audioBuffer,
+	duration: durationProp,
+	trimStart = 0,
+	playbackRate = 1,
+	height = 32,
+	volume = 1,
+	className = "",
+}: AudioWaveformProps) {
+	const waveformRef = useRef<HTMLDivElement>(null);
+	const wavesurfer = useRef<WaveSurfer | null>(null);
+	const [isLoading, setIsLoading] = useState(true);
+	const [error, setError] = useState(false);
+	const [mediaDuration, setMediaDuration] = useState(0);
+
+	useEffect(() => {
+		let mounted = true;
+
+		setError(false);
+		setIsLoading(true);
+		setMediaDuration(0);
+
+		const destroyWaveSurfer = () => {
+			const currentWaveSurfer = wavesurfer.current;
+			wavesurfer.current = null;
+
+			if (!currentWaveSurfer) return;
+
+			try {
+				currentWaveSurfer.destroy();
+			} catch {}
+		};
+
+		const initWaveSurfer = async () => {
+			if (!waveformRef.current || (!audioUrl && !audioBlob && !audioBuffer)) {
+				return;
+			}
+
+			try {
+				destroyWaveSurfer();
+
+				const newWaveSurfer = WaveSurfer.create({
+					container: waveformRef.current,
+					waveColor: "rgba(255, 255, 255, 0.6)",
+					progressColor: "rgba(255, 255, 255, 0.9)",
+					cursorColor: "transparent",
+					barWidth: 2,
+					barGap: 1,
+					height,
+					normalize: true,
+					interact: false,
+				});
+
+				if (mounted) {
+					wavesurfer.current = newWaveSurfer;
+				} else {
+					try {
+						newWaveSurfer.destroy();
+					} catch {}
+					return;
+				}
+
+				// 这里不传 duration 提示：提示值会让 wavesurfer 用「片段时长」当整条长度，
+				// 裁剪后的窗口就算不出来。真实长度一律以解码结果为准。
+				if (audioBuffer) {
+					const peaks = extractPeaks({ buffer: audioBuffer });
+					await newWaveSurfer.load("", peaks, audioBuffer.duration);
+				} else if (audioBlob) {
+					await newWaveSurfer.loadBlob(audioBlob);
+				} else if (audioUrl) {
+					await newWaveSurfer.load(audioUrl);
+				}
+
+				if (mounted) {
+					setMediaDuration(newWaveSurfer.getDuration() || 0);
+					setIsLoading(false);
+					setError(false);
+				}
+			} catch (err) {
+				if (mounted) {
+					console.error("Failed to initialize WaveSurfer:", err);
+					setError(true);
+					setIsLoading(false);
+				}
+			}
+		};
+
+		void initWaveSurfer();
+
+		return () => {
+			mounted = false;
+			destroyWaveSurfer();
+		};
+	}, [audioUrl, audioBlob, audioBuffer, height]);
+
+	/**
+	 * 可见窗口：片段只显示素材里 [trimStart, trimStart + duration*rate] 这一段。
+	 * 做法是把整条波形按「素材时长 / 可见源时长」放宽到片段宽度的 N 倍，
+	 * 再左移 trimStart 对应的比例；外层 overflow-hidden 露出的正好是这一窗。
+	 */
+	const view = useMemo(() => {
+		const rate = playbackRate > 0 ? playbackRate : 1;
+		const clipSeconds = durationProp && durationProp > 0 ? durationProp * rate : 0;
+		if (!mediaDuration || !clipSeconds) return { width: 100, shift: 0 };
+		const clampStart = Math.min(Math.max(trimStart, 0), mediaDuration);
+		return {
+			width: Math.max(100, (mediaDuration / clipSeconds) * 100),
+			shift: (clampStart / mediaDuration) * 100,
+		};
+	}, [durationProp, playbackRate, trimStart, mediaDuration]);
+
+	if (error) {
+		return (
+			<div
+				className={`flex items-center justify-center ${className}`}
+				style={{ height }}
+			>
+				<span className="text-foreground/60 text-xs">Audio unavailable</span>
+			</div>
+		);
+	}
+
+	const clampedVolume = Math.min(volume, 2);
+
+	return (
+		<div className={`relative overflow-hidden ${className}`} style={{ height }}>
+			{isLoading && (
+				<div className="absolute inset-0 flex items-center justify-center">
+					<span className="text-foreground/60 text-xs">Loading...</span>
+				</div>
+			)}
+			<div
+				style={{
+					width: `${view.width}%`,
+					height,
+					transform: `translateX(-${view.shift}%) scaleY(${clampedVolume})`,
+					transformOrigin: "center",
+				}}
+			>
+				<div
+					ref={waveformRef}
+					className={`h-full w-full transition-opacity duration-150 ${isLoading ? "opacity-0" : "opacity-100"}`}
+					style={{ height }}
+				/>
+			</div>
+		</div>
+	);
+}
+
+export default AudioWaveform;
+"""
+    )
+    + "\n",
+    encoding="utf-8",
+)
+print(f"  wrote {AUDIO_WAVEFORM_FILE.relative_to(ROOT)} (波形按裁剪窗口显示)")
+
+
 # ------------------------- 视频片段：分离音频（muted）后不再画波形
 TIMELINE_ELEMENT = SRC / "components" / "editor" / "panels" / "timeline" / "timeline-element.tsx"
 _te = TIMELINE_ELEMENT.read_text(encoding="utf-8")
@@ -8238,6 +8456,8 @@ if "beautifiedFile" not in _te:
         "\t\t\t\t\t</div>\n"
         "\t\t\t\t</div>",
         "\t\t\t\t\t\t\t\tduration={element.duration}\n"
+        "\t\t\t\t\t\t\t\ttrimStart={element.trimStart}\n"
+        "\t\t\t\t\t\t\t\tplaybackRate={element.playbackRate ?? 1}\n"
         "\t\t\t\t\t\t\t\theight={bandHeight * 2}\n"
         '\t\t\t\t\t\t\t\tclassName="w-full"\n'
         "\t\t\t\t\t\t\t/>\n"
@@ -8255,6 +8475,30 @@ if "beautifiedFile" not in _te:
     TIMELINE_ELEMENT.write_text(_te, encoding="utf-8")
     print(f"  patched {TIMELINE_ELEMENT.relative_to(ROOT)} (分离音频后不画波形)")
 
+
+
+
+# 音频轨的波形同样要跟裁剪走（同一个组件，补上 trimStart / 变速倍率）
+_te2 = TIMELINE_ELEMENT.read_text(encoding="utf-8")
+_audio_wave_old = (
+    "\t\t\t\t\t\t\taudioUrl={audioUrl}\n"
+    "\t\t\t\t\t\t\tduration={element.duration}\n"
+    "\t\t\t\t\t\t\tvolume={element.volume}\n"
+)
+_audio_wave_new = (
+    "\t\t\t\t\t\t\taudioUrl={audioUrl}\n"
+    "\t\t\t\t\t\t\tduration={element.duration}\n"
+    "\t\t\t\t\t\t\ttrimStart={element.trimStart}\n"
+    "\t\t\t\t\t\t\tplaybackRate={element.playbackRate ?? 1}\n"
+    "\t\t\t\t\t\t\tvolume={element.volume}\n"
+)
+if _audio_wave_old in _te2:
+    TIMELINE_ELEMENT.write_text(
+        _te2.replace(_audio_wave_old, _audio_wave_new, 1), encoding="utf-8"
+    )
+    print(f"  patched {TIMELINE_ELEMENT.relative_to(ROOT)} (音频波形跟裁剪)")
+else:
+    raise SystemExit(f"音频波形锚点没找到：{TIMELINE_ELEMENT}")
 
 # ------------------- 预览/客户端导出：视频勾了人声美化就用处理后的音频
 AUDIO_LIB = SRC / "lib" / "media" / "audio.ts"
@@ -8420,6 +8664,14 @@ function visualBox({
 }
 
 /** 画布单位 → 屏幕像素：直接按显示尺寸排版，避免多一张 1080p 缩放层。 */
+/** 把源时间夹进 [0, 素材末尾-0.05]：seek 过片尾在 Chromium 里会画成纯黑，
+ *  rAF 的 tick 和 syncVideos 必须共用同一套夹取，否则两边会互相打架。 */
+function clampToMedia(video: HTMLVideoElement, target: number): number {
+  const mediaDuration = Number.isFinite(video.duration) ? video.duration : 0;
+  if (mediaDuration <= 0) return Math.max(target, 0);
+  return Math.min(Math.max(target, 0), Math.max(mediaDuration - 0.05, 0));
+}
+
 function layerStyle({
   element,
   box,
@@ -8493,11 +8745,36 @@ function VideoLayer({
       "ratechange",
     ];
     for (const name of events) video.addEventListener(name, notify);
+
+    // 挂载时先把画面定位到「当前播放头」对应的源时间，再让它播。
+    // 不这么做的话：片段一出现（转场/断点）就从 0 秒开始播，随后 tick 发现跑偏
+    // 再 seek 到正确位置 —— 那一次 seek 会让浏览器重新解码，观众看到的就是闪一下。
+    const prime = () => {
+      const target = getVisualSourceTime({
+        timelineTime: editor.playback.getCurrentTime(),
+        startTime: element.startTime,
+        duration: element.duration,
+        trimStart: element.trimStart,
+        playbackRate: element.playbackRate ?? 1,
+        reversed: element.reversed ?? false,
+      });
+      const next = clampToMedia(video, target);
+      if (!Number.isFinite(next)) return;
+      // 已经在播且有画面时不要插一脚：那种情况交给 tick（带节流），
+      // 这里只负责「刚挂载 / 还没出画」时的首次定位。
+      if (!video.paused && video.readyState >= 2) return;
+      if (Math.abs(video.currentTime - next) > 0.02) {
+        video.currentTime = next;
+      }
+    };
+    prime();
+    video.addEventListener("loadedmetadata", prime, { once: true });
     return () => {
       for (const name of events) video.removeEventListener(name, notify);
+      video.removeEventListener("loadedmetadata", prime);
       registerVideo({ id: element.id, element, video: null });
     };
-  }, [element, registerVideo]);
+  }, [element.id, element.startTime, element.duration, element.trimStart, editor, registerVideo]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -8522,20 +8799,25 @@ function VideoLayer({
         playbackRate: rate,
         reversed,
       });
-      const mediaDuration = Number.isFinite(video.duration) ? video.duration : 0;
-      const clamped =
-        mediaDuration > 0
-          ? Math.min(Math.max(target, 0), Math.max(mediaDuration - 0.05, 0))
-          : Math.max(target, 0);
-
+      const clamped = clampToMedia(video, target);
       if (Math.abs(video.playbackRate - rate) > 0.001) {
         video.playbackRate = rate;
       }
 
+      // 播放中只在「确实跑偏」时校正，且每 400 ms 最多一次：
+      // 连续 seek 会让浏览器重新解码，画面就是一闪一闪的。
+      const now = Date.now();
+      const lastSeek = video.dataset.ysSeekAt ? Number(video.dataset.ysSeekAt) : 0;
+      const canSeek = now - lastSeek > 400;
+      const seekTo = (value: number) => {
+        video.dataset.ysSeekAt = String(now);
+        video.currentTime = value;
+      };
+
       if (playing && !reversed) {
         if (video.paused) void video.play().catch(() => {});
-        if (appAdvancing && Math.abs(video.currentTime - clamped) > 0.35) {
-          video.currentTime = clamped;
+        if (appAdvancing && canSeek && Math.abs(video.currentTime - clamped) > 0.45) {
+          seekTo(clamped);
         }
       } else {
         if (!video.paused) video.pause();
@@ -8779,7 +9061,10 @@ export function PreviewDomLayers({
   const mediaAssets = editor.media.getAssets();
   const activeProject = editor.project.getActive();
   const background: TBackground = activeProject.settings.background;
-  const fitCanvasSize = activeProject.settings.originalCanvasSize ?? canvasSize;
+  // 适配基准 = 画布本身。原来源码用的是 settings.originalCanvasSize
+  // （第一次插入素材时记下的尺寸），画布改过比例后它不会跟着变，
+  // 预览里素材就只剩画布一小块，而导出按画布合成 → 看起来像「导出被放大」。
+  const fitCanvasSize = canvasSize;
 
   const mediaMap = useMemo(
     () => new Map(mediaAssets.map((asset) => [asset.id, asset])),
@@ -8832,7 +9117,6 @@ export function PreviewDomLayers({
     }
     return null;
   };
-
   /** 让 <video> 的播放/暂停、暂停时的画面位置跟 app 状态一致。
    *  放在定时器/事件里跑，而不是只在 rAF 里跑：rAF 被限流时按播放也能起来。 */
   const syncVideos = () => {
@@ -8840,11 +9124,6 @@ export function PreviewDomLayers({
     const appTime = editor.playback.getCurrentTime();
     for (const { element, video } of playingVideos.current.values()) {
       const shouldPlay = playing && !element.reversed;
-      if (shouldPlay) {
-        if (video.paused && !video.ended) void video.play().catch(() => {});
-        continue;
-      }
-      if (!video.paused) video.pause();
       const target = getVisualSourceTime({
         timelineTime: appTime,
         startTime: element.startTime,
@@ -8853,21 +9132,67 @@ export function PreviewDomLayers({
         playbackRate: element.playbackRate ?? 1,
         reversed: element.reversed ?? false,
       });
+      const clamped = clampToMedia(video, target);
+      if (shouldPlay) {
+        // 播到片尾（ended）必须能重新起来：先回到目标位置再播，
+        // 否则「播完停下」之后按播放永远黑屏。
+        // 播放中的对表交给 rAF 的 tick（带 400ms 节流），这里再抢一次就会闪。
+        if (video.ended) video.currentTime = clamped;
+        if (video.paused) void video.play().catch(() => {});
+        continue;
+      }
+      if (!video.paused) video.pause();
       if (
-        Number.isFinite(target) &&
-        Math.abs(video.currentTime - target) > 0.05
+        Number.isFinite(clamped) &&
+        Math.abs(video.currentTime - clamped) > 0.02
       ) {
-        video.currentTime = Math.max(target, 0);
+        video.currentTime = clamped;
       }
     }
   };
+  // ComfyUI 弹层关闭时发来 "pause"：把播放状态和所有 <video> 一起停掉。
+  // iframe 是常驻的（关闭只是隐藏），不这么做关掉弹层后声音还在放。
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (event.data?.type !== "yuancut:command") return;
+      if (event.data.command !== "pause") return;
+      editor.playback.pause();
+      for (const { video } of playingVideos.current.values()) {
+        try {
+          video.pause();
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [editor]);
+
+  // 播放时的时钟选择：
+  // · app 时钟在推进（正常播放）→ 以它为准。它和音频同源，不会像「由视频反推」
+  //   那样在两段重叠（转场）、变速片段或多次映射之间来回跳；
+  //   每跳一次就会触发一次 seek，画面就闪一下——这就是 1.3 倍速 + 转场闪烁的来源。
+  // · app 时钟停住（rAF 被限流）→ 才退回视频时钟，保证字幕不卡死。
+  const lastAppTimeRef = useRef(-1);
+  const lastAppAdvanceRef = useRef(0);
 
   const currentDisplayTime = (): number => {
-    if (editor.playback.getIsPlaying()) {
+    const appTime = editor.playback.getCurrentTime();
+    if (!editor.playback.getIsPlaying()) {
+      lastAppTimeRef.current = appTime;
+      return appTime;
+    }
+    if (Math.abs(appTime - lastAppTimeRef.current) > 1e-4) {
+      lastAppTimeRef.current = appTime;
+      lastAppAdvanceRef.current = Date.now();
+      return appTime;
+    }
+    if (Date.now() - lastAppAdvanceRef.current > 250) {
       const fromVideo = timelineTimeFromVideos();
       if (fromVideo !== null) return fromVideo;
     }
-    return editor.playback.getCurrentTime();
+    return appTime;
   };
 
   // 只有「可见元素集合变化」或「暂停时时间变化（拖播放头）」才重渲染。
@@ -8998,12 +9323,75 @@ PREVIEW_DOM_LAYERS.write_text(PREVIEW_DOM_LAYERS_SOURCE + "\n", encoding="utf-8"
 print(f"  wrote {PREVIEW_DOM_LAYERS.relative_to(ROOT)} (DOM 预览层)")
 
 
+# --------------------------- 选中框 / 拖动命中：同样以画布为适配基准
+# 只改预览层会让「看到的画面」和「选中框 / 拖动」错位，这三处必须同源。
+_FIT_PATCHES = [
+    (
+        SRC / "components" / "editor" / "panels" / "preview" / "selection-overlay.tsx",
+        "\tconst fitCanvasSize = activeProject?.settings.originalCanvasSize ?? {\n"
+        "\t\twidth: canvasWidth,\n"
+        "\t\theight: canvasHeight,\n"
+        "\t};\n",
+        "\tconst fitCanvasSize = { width: canvasWidth, height: canvasHeight };\n",
+    ),
+    (
+        SRC / "hooks" / "use-preview-interaction.ts",
+        "\t\t\tconst fitCanvasSize = editor.project.getActive().settings\n"
+        "\t\t\t\t.originalCanvasSize ?? { width: canvasWidth, height: canvasHeight };\n",
+        "\t\t\tconst fitCanvasSize = { width: canvasWidth, height: canvasHeight };\n",
+    ),
+    (
+        SRC / "core" / "managers" / "project-manager.ts",
+        "\t\tconst { canvasSize, originalCanvasSize, background } = this.active.settings;\n",
+        "\t\tconst { canvasSize, background } = this.active.settings;\n",
+    ),
+    (
+        SRC / "core" / "managers" / "project-manager.ts",
+        "\t\t\tfitCanvasSize: originalCanvasSize ?? canvasSize,\n",
+        "\t\t\tfitCanvasSize: canvasSize,\n",
+    ),
+    (
+        SRC / "core" / "managers" / "renderer-manager.ts",
+        "\t\t\t\tfitCanvasSize:\n"
+        "\t\t\t\t\tactiveProject.settings.originalCanvasSize ?? canvasSize,\n",
+        "\t\t\t\tfitCanvasSize: canvasSize,\n",
+    ),
+    (
+        SRC / "lib" / "ai" / "agent" / "tools" / "frame-tools.ts",
+        "\t\t\t\tfitCanvasSize:\n"
+        "\t\t\t\t\tproject.settings.originalCanvasSize ?? project.settings.canvasSize,\n",
+        "\t\t\t\tfitCanvasSize: project.settings.canvasSize,\n",
+    ),
+    (
+        SRC / "components" / "editor" / "panels" / "preview" / "index.tsx",
+        "\t\t\tfitCanvasSize: activeProject.settings.originalCanvasSize ?? {\n"
+        "\t\t\t\twidth,\n"
+        "\t\t\t\theight,\n"
+        "\t\t\t},\n",
+        "\t\t\tfitCanvasSize: { width, height },\n",
+    ),
+    (
+        SRC / "components" / "editor" / "mobile" / "mobile-preview.tsx",
+        "\t\t\tfitCanvasSize: activeProject.settings.originalCanvasSize ?? {\n"
+        "\t\t\t\twidth,\n"
+        "\t\t\t\theight,\n"
+        "\t\t\t},\n",
+        "\t\t\tfitCanvasSize: { width, height },\n",
+    ),
+]
+for _fit_path, _fit_old, _fit_new in _FIT_PATCHES:
+    _fit_text = _fit_path.read_text(encoding="utf-8")
+    if _fit_old not in _fit_text:
+        raise SystemExit(f"适配基准补丁锚点没找到：{_fit_path}")
+    _fit_path.write_text(_fit_text.replace(_fit_old, _fit_new, 1), encoding="utf-8")
+    print(f"  patched {_fit_path.relative_to(ROOT)} (预览适配基准 = 画布)")
+
+
 # 预览面板：把每帧 canvas 合成换成 DOM 层
 PREVIEW_PANEL_FILE = (
     SRC / "components" / "editor" / "panels" / "preview" / "index.tsx"
 )
 _pp = PREVIEW_PANEL_FILE.read_text(encoding="utf-8")
-
 if "PreviewDomLayers" not in _pp:
     _pp = _pp.replace(
         'import { useCallback, useEffect, useMemo, useRef } from "react";',
@@ -9293,6 +9681,48 @@ patch_text(
             1,
         ),
         (_right_old, _right_new, 1),
+        # 收缩方向必须锚回「片段自己」：
+        # 之前把上界换成了素材总时长，素材比片段长时能一路把片段裁成 0 甚至负数，
+        # 于是 element.duration<=0 → 预览 isActive 恒 false → 黑屏只剩字幕。
+        (
+            T(3) + "const maxAllowed =" + NL
+            + T(4) + "sourceDuration - resizing.initialTrimEnd - minDurationSeconds * rate;",
+            T(3) + "const clipWindow =" + NL
+            + T(4) + "resizing.initialTrimStart + resizing.initialDuration * rate;" + NL
+            + T(3) + "// 上界取「素材剩余」和「片段自身窗口」的较小者，片段至少留一帧" + NL
+            + T(3) + "const maxAllowed =" + NL
+            + T(4) + "Math.min(sourceDuration - resizing.initialTrimEnd, clipWindow) -" + NL
+            + T(4) + "minDurationSeconds * rate;",
+            1,
+        ),
+        (
+            T(4) + "const maxTrimEnd =" + NL
+            + T(5) + "sourceDuration - resizing.initialTrimStart - minDurationSeconds * rate;",
+            T(4) + "// 同理：右边缘最多收到片段自己剩下的一帧" + NL
+            + T(4) + "const maxTrimEnd =" + NL
+            + T(5) + "Math.min(" + NL
+            + T(6) + "sourceDuration - resizing.initialTrimStart," + NL
+            + T(6) + "resizing.initialDuration * rate," + NL
+            + T(5) + ") - minDurationSeconds * rate;",
+            1,
+        ),
+        # 兜底：任何路径算出的时长都不许低于一帧（snapTimeToFrame 不夹负值）
+        (
+            T(4) + "time: resizing.initialDuration - timelineDelta,",
+            T(4) + "time: Math.max(" + NL
+            + T(5) + "minDurationSeconds," + NL
+            + T(5) + "resizing.initialDuration - timelineDelta," + NL
+            + T(4) + "),",
+            2,
+        ),
+        (
+            T(4) + "time: resizing.initialDuration - sourceTrimDelta / rate,",
+            T(4) + "time: Math.max(" + NL
+            + T(5) + "minDurationSeconds," + NL
+            + T(5) + "resizing.initialDuration - sourceTrimDelta / rate," + NL
+            + T(4) + "),",
+            1,
+        ),
     ],
 )
 
@@ -10571,6 +11001,112 @@ patch_text(
     ],
 )
 
+# ------------------------------------------------ 视频片段：音量（多选一起改）
+# 视频自带的音轨一直只能整体静音，音量没入口：素材音轨走的是同一套 AudioClip，
+# 缺的只是 types 里的字段和面板控件。
+TIMELINE_TYPES = SRC / "types" / "timeline.ts"
+_tt = TIMELINE_TYPES.read_text(encoding="utf-8")
+if "volume?: number;" not in _tt.split("export interface VideoElement", 1)[-1][:400]:
+    _video_block_old = (
+        "\ttransform: Transform;\n"
+        "\topacity: number;\n"
+        "\tplaybackRate?: number;\n"
+    )
+    _video_block_new = (
+        "\ttransform: Transform;\n"
+        "\topacity: number;\n"
+        "\t/** 片段自带的音量（0~2），与音频轨一致；预览和导出都按它混音 */\n"
+        "\tvolume?: number;\n"
+        "\tplaybackRate?: number;\n"
+    )
+    if _tt.count(_video_block_old) != 1:
+        raise SystemExit(f"VideoElement 字段锚点不对：{TIMELINE_TYPES}")
+    TIMELINE_TYPES.write_text(
+        _tt.replace(_video_block_old, _video_block_new, 1), encoding="utf-8"
+    )
+    print(f"  patched {TIMELINE_TYPES.relative_to(ROOT)} (视频音量字段)")
+
+patch_text(
+    VIDEO_PROPERTIES,
+    "const volumePercent =",
+    [
+        (
+            "\tconst initialSpeedRef = useRef<number | null>(null);\n",
+            "\tconst initialSpeedRef = useRef<number | null>(null);\n"
+            "\tconst initialVolumeRef = useRef<number | null>(null);\n"
+            "\t// 多选时显示第一个片段的音量，改动分发到全部选中片段\n"
+            "\tconst volumePercent = Math.round(\n"
+            "\t\t((element as VideoElement).volume ?? 1) * 100,\n"
+            "\t);\n",
+            1,
+        ),
+        (
+            "\t\t\t\t{isVideoElement && (\n",
+            '\t\t\t\t{isVideoElement && (\n'
+            '\t\t\t\t\t<PropertyGroup title="音量" collapsible={false}>\n'
+            '\t\t\t\t\t\t<div className="space-y-6">\n'
+            '\t\t\t\t\t\t\t<PropertyItem direction="column">\n'
+            "\t\t\t\t\t\t\t\t<PropertyItemLabel>音量</PropertyItemLabel>\n"
+            "\t\t\t\t\t\t\t\t<PropertyItemValue>\n"
+            '\t\t\t\t\t\t\t\t\t<div className="flex items-center gap-2">\n'
+            "\t\t\t\t\t\t\t\t\t\t<Slider\n"
+            "\t\t\t\t\t\t\t\t\t\t\tvalue={[volumePercent]}\n"
+            "\t\t\t\t\t\t\t\t\t\t\tmin={0}\n"
+            "\t\t\t\t\t\t\t\t\t\t\tmax={200}\n"
+            "\t\t\t\t\t\t\t\t\t\t\tstep={1}\n"
+            '\t\t\t\t\t\t\t\t\t\t\tclassName="w-full"\n'
+            "\t\t\t\t\t\t\t\t\t\t\tonValueChange={([value]) => {\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\tif (initialVolumeRef.current === null) {\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\tinitialVolumeRef.current =\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\t\t(element as VideoElement).volume ?? 1;\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t}\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\tupdateRefs(videoRefs, { volume: value / 100 }, false);\n"
+            "\t\t\t\t\t\t\t\t\t\t\t}}\n"
+            "\t\t\t\t\t\t\t\t\t\t\tonValueCommit={([value]) => {\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\tif (initialVolumeRef.current !== null) {\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\tupdateRefs(\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\t\tvideoRefs,\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\t\t{ volume: initialVolumeRef.current },\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\t\tfalse,\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\t);\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\tupdateRefs(videoRefs, { volume: value / 100 }, true);\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\tinitialVolumeRef.current = null;\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t}\n"
+            "\t\t\t\t\t\t\t\t\t\t\t}}\n"
+            "\t\t\t\t\t\t\t\t\t\t/>\n"
+            "\t\t\t\t\t\t\t\t\t\t<Input\n"
+            '\t\t\t\t\t\t\t\t\t\t\ttype="number"\n'
+            "\t\t\t\t\t\t\t\t\t\t\tvalue={volumePercent}\n"
+            "\t\t\t\t\t\t\t\t\t\t\tmin={0}\n"
+            "\t\t\t\t\t\t\t\t\t\t\tmax={200}\n"
+            "\t\t\t\t\t\t\t\t\t\t\tonChange={(e) => {\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\tconst parsed = parseInt(e.target.value, 10);\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\tif (Number.isNaN(parsed)) return;\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\tconst clamped = clamp({\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\tvalue: parsed,\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\tmin: 0,\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t\tmax: 200,\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\t});\n"
+            "\t\t\t\t\t\t\t\t\t\t\t\tupdateRefs(videoRefs, { volume: clamped / 100 }, true);\n"
+            "\t\t\t\t\t\t\t\t\t\t\t}}\n"
+            '\t\t\t\t\t\t\t\t\t\t\tclassName="bg-accent h-7 w-14 [appearance:textfield] rounded-sm px-2 text-center !text-xs [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"\n'
+            "\t\t\t\t\t\t\t\t\t\t/>\n"
+            "\t\t\t\t\t\t\t\t\t</div>\n"
+            "\t\t\t\t\t\t\t\t</PropertyItemValue>\n"
+            "\t\t\t\t\t\t\t</PropertyItem>\n"
+            '\t\t\t\t\t\t\t<p className="text-muted-foreground text-[11px] leading-relaxed">\n'
+            "\t\t\t\t\t\t\t\t百分数：100 = 原声，200 = 放大一倍。框选多个视频片段时一起改。\n"
+            "\t\t\t\t\t\t\t</p>\n"
+            "\t\t\t\t\t\t</div>\n"
+            "\t\t\t\t\t</PropertyGroup>\n"
+            "\t\t\t\t)}\n"
+            "\n"
+            "\t\t\t\t{isVideoElement && (\n",
+            1,
+        ),
+    ],
+)
+
 replace_between(
     VIDEO_PROPERTIES,
     "\tconst applySpeedChange = ({",
@@ -11113,3 +11649,260 @@ patch_text(
         ),
     ],
 )
+
+
+# =====================================================================
+# 可选扩展：通用插槽 + 宿主桥（插件里不含任何具体扩展业务）
+# ---------------------------------------------------------------------
+# 三个面板（音频 / 文本 / 贴纸）各留一个空的挂载点 <ExtSlot name=.../>，
+# 外部脚本自己往里挂 UI；宿主桥 window.__yuancutExt 只提供通用的
+# 「导入素材 / 插音频 / 给选中的文字换字体」三件事。
+# 扩展不存在时：插槽是空 div、桥没人用、页面行为与现在完全一致。
+# =====================================================================
+
+write(
+    SRC / "components" / "editor" / "ext-slot.tsx",
+    '''"use client";
+
+/**
+ * 可选扩展的挂载点：插件只渲染一个空 div，外部脚本自己往里挂 UI。
+ * 没有扩展时就是几个空节点，不占位、不发请求。
+ */
+export function ExtSlot({ name }: { name: string }) {
+\treturn <div data-yc-ext-slot={name} />;
+}
+''',
+)
+
+write(
+    SRC / "lib" / "ext-host.ts",
+    '''"use client";
+
+import { EditorCore } from "@/core";
+import { processMediaAssets } from "@/lib/media/processing";
+import { buildUploadAudioElement } from "@/lib/timeline/element-utils";
+
+type ExtAssetInfo = {
+\tassetId: string;
+\tname: string;
+\ttype: string;
+\tduration: number;
+};
+
+type ExtPanelKind = "audio" | "media";
+
+declare global {
+\tinterface Window {
+\t\t__yuancutExt?: {
+\t\t\tgetEditor: () => EditorCore;
+\t\t\timportFile: (options: { file: File; panel?: ExtPanelKind }) => Promise<ExtAssetInfo>;
+\t\t\tinsertAudio: (options: { assetId: string; startTime?: number }) => boolean;
+\t\t\tapplyFont: (options: { fontFamily: string }) => number;
+\t\t};
+\t}
+}
+
+let installed = false;
+
+/**
+ * 宿主桥：给可选扩展用的通用能力。只用 EditorCore 的公开接口，
+ * 不引入任何扩展特有的逻辑。重复调用无副作用。
+ */
+export function installExtHost(): void {
+\tif (installed || typeof window === "undefined") return;
+\tinstalled = true;
+
+\twindow.__yuancutExt = {
+\t\tgetEditor: () => EditorCore.getInstance(),
+
+\t\timportFile: async ({ file, panel = "audio" }) => {
+\t\t\tconst editor = EditorCore.getInstance();
+\t\t\tconst project = editor.project.getActiveOrNull();
+\t\t\tif (!project) throw new Error("no active project");
+\t\t\tconst [processed] = await processMediaAssets({ files: [file] });
+\t\t\tif (!processed) throw new Error("media processing failed");
+\t\t\tconst assetId = await editor.media.addMediaAsset({
+\t\t\t\tprojectId: project.metadata.id,
+\t\t\t\tasset: { ...processed, panel },
+\t\t\t});
+\t\t\treturn {
+\t\t\t\tassetId,
+\t\t\t\tname: processed.name,
+\t\t\t\ttype: processed.type,
+\t\t\t\tduration: processed.duration ?? 0,
+\t\t\t};
+\t\t},
+
+\t\tinsertAudio: ({ assetId, startTime }) => {
+\t\t\tconst editor = EditorCore.getInstance();
+\t\t\tif (!editor.project.getActiveOrNull()) return false;
+\t\t\tconst asset = editor.media.getAssets().find((item) => item.id === assetId);
+\t\t\tif (!asset) return false;
+\t\t\teditor.timeline.insertElement({
+\t\t\t\telement: buildUploadAudioElement({
+\t\t\t\t\tmediaId: asset.id,
+\t\t\t\t\tname: asset.name,
+\t\t\t\t\tduration: asset.duration ?? 0,
+\t\t\t\t\tstartTime: startTime ?? editor.playback.getCurrentTime(),
+\t\t\t\t}),
+\t\t\t\tplacement: { mode: "auto" },
+\t\t\t});
+\t\t\treturn true;
+\t\t},
+
+\t\tapplyFont: ({ fontFamily }) => {
+\t\t\tconst editor = EditorCore.getInstance();
+\t\t\tconst selected = editor.selection.getSelectedElements();
+\t\t\tconst targets = editor.timeline
+\t\t\t\t.getElementsWithTracks({ elements: selected })
+\t\t\t\t.filter((item) => item.element.type === "text");
+\t\t\tif (targets.length === 0) return 0;
+\t\t\teditor.timeline.updateElements({
+\t\t\t\tupdates: targets.map((item) => ({
+\t\t\t\t\ttrackId: item.track.id,
+\t\t\t\t\telementId: item.element.id,
+\t\t\t\t\tupdates: { fontFamily },
+\t\t\t\t})),
+\t\t\t\tpushHistory: true,
+\t\t\t});
+\t\t\treturn targets.length;
+\t\t},
+\t};
+}
+''',
+)
+
+patch_text(
+    SRC / "components" / "providers" / "editor-provider.tsx",
+    "installExtHost();",
+    [
+        (
+            "\tuseEditorActions();\n\tuseKeybindingsListener();\n\treturn null;",
+            "\tuseEditorActions();\n\tuseKeybindingsListener();\n\tuseEffect(() => {\n"
+            "\t\tinstallExtHost();\n"
+            "\t}, []);\n"
+            "\treturn null;",
+            1,
+        ),
+        (
+            'import { useEditorActions } from "@/hooks/actions/use-editor-actions";',
+            'import { useEditorActions } from "@/hooks/actions/use-editor-actions";\n'
+            'import { installExtHost } from "@/lib/ext-host";',
+            1,
+        ),
+    ],
+)
+
+# 音频面板：列表上方
+patch_text(
+    SRC / "components" / "editor" / "panels" / "assets" / "views" / "sounds.tsx",
+    "<ExtSlot name=\"audio\" />",
+    [
+        (
+            '\t\t\t\t\t\t<div\n\t\t\t\t\t\t\tclassName="scrollbar-thin size-full overflow-y-auto"\n'
+            "\t\t\t\t\t\t\tonMouseDown={marquee.handleMouseDown}\n\t\t\t\t\t\t>",
+            '\t\t\t\t\t\t<ExtSlot name="audio" />\n'
+            "\n"
+            '\t\t\t\t\t\t<div\n\t\t\t\t\t\t\tclassName="scrollbar-thin size-full overflow-y-auto"\n'
+            "\t\t\t\t\t\t\tonMouseDown={marquee.handleMouseDown}\n\t\t\t\t\t\t>",
+            1,
+        ),
+        (
+            'import { SelectionBox } from "@/components/editor/selection-box";',
+            'import { SelectionBox } from "@/components/editor/selection-box";\n'
+            'import { ExtSlot } from "@/components/editor/ext-slot";',
+            1,
+        ),
+    ],
+)
+
+# 文本面板：默认文字下面
+patch_text(
+    SRC / "components" / "editor" / "panels" / "assets" / "views" / "text.tsx",
+    "<ExtSlot name=\"text\" />",
+    [
+        (
+            "\t\t\t</div>\n\t\t</BaseView>\n\t);\n}",
+            "\t\t\t</div>\n"
+            '\t\t\t<ExtSlot name="text" />\n'
+            "\t\t</BaseView>\n\t);\n}",
+            1,
+        ),
+        (
+            'import { PanelBaseView as BaseView } from "@/components/editor/panels/panel-base-view";',
+            'import { PanelBaseView as BaseView } from "@/components/editor/panels/panel-base-view";\n'
+            'import { ExtSlot } from "@/components/editor/ext-slot";',
+            1,
+        ),
+    ],
+)
+
+# 贴纸面板：图标标签上方
+patch_text(
+    SRC / "components" / "editor" / "panels" / "assets" / "views" / "stickers.tsx",
+    "<ExtSlot name=\"sticker\" />",
+    [
+        (
+            "\treturn (\n\t\t<BaseView",
+            '\treturn (\n\t\t<>\n\t\t\t<ExtSlot name="sticker" />\n\t\t\t<BaseView',
+            1,
+        ),
+        (
+            '\t\t\tclassName="flex h-full flex-col overflow-hidden p-0"\n\t\t/>\n\t);\n}',
+            '\t\t\tclassName="flex h-full flex-col overflow-hidden p-0"\n'
+            "\t\t/>\n\t\t</>\n\t);\n}",
+            1,
+        ),
+        (
+            'import { PanelBaseView as BaseView } from "@/components/editor/panels/panel-base-view";',
+            'import { PanelBaseView as BaseView } from "@/components/editor/panels/panel-base-view";\n'
+            'import { ExtSlot } from "@/components/editor/ext-slot";',
+            1,
+        ),
+    ],
+)
+
+print("  wrote ext-slot.tsx / ext-host.ts（可选扩展插槽 + 宿主桥）")
+
+
+# =====================================================================
+# 导出分辨率：「项目」= 可见素材最大分辨率（不再是画布像素）
+# ---------------------------------------------------------------------
+# 画布尺寸来自第一个导入的素材，如果拿它当「项目分辨率」，
+# 后面更高分辨率的素材就被这条上限压住了。这里改成按可见素材的最大
+# 分辨率、保持项目比例取整；选 2K/4K 时本来就走比例×短边，不受影响。
+# =====================================================================
+
+EXPORT_LIB = SRC / "lib" / "export.ts"
+
+
+EXPORT_BUTTON = SRC / "components" / "editor" / "export-button.tsx"
+
+_eb = EXPORT_BUTTON.read_text(encoding="utf-8")
+if "resolveSourceSize" not in _eb:
+    _eb = _eb.replace(
+        "output: resolveExportSize({ canvasSize, resolution }),",
+        "output: resolveExportSize({\n"
+        "\t\t\t\t\tcanvasSize,\n"
+        "\t\t\t\t\tresolution,\n"
+        "\t\t\t\t\tsourceSize: resolveSourceSize({\n"
+        "\t\t\t\t\t\ttracks: serverTracks,\n"
+        "\t\t\t\t\t\tmediaAssets: editor.media.getAssets(),\n"
+        "\t\t\t\t\t}),\n"
+        "\t\t\t\t}),",
+        1,
+    )
+    # 补 import：这个 import 是多行的，直接锚在收尾那一行上
+    if "\tresolveSourceSize,\n} from \"@/lib/export\";" not in _eb:
+        _eb = _eb.replace(
+            '} from "@/lib/export";',
+            "\tresolveSourceSize,\n} from \"@/lib/export\";",
+            1,
+        )
+    # 面板标签那一行留到下一轮（需要同时改 getExportResolutionLabel 的类型签名）
+
+
+
+
+# （画布/帧率同步、导出挂起预览、NVENC 三块补丁暂时移除：实现已合入运行时文件，
+#   以后要重建时再单独补回，避免补丁脚本继续膨胀）

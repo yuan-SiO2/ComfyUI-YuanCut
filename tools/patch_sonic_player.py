@@ -130,7 +130,7 @@ registerProcessor("sonic-player", SonicPlayer);
 
 # ------------------------------------------------------- 引擎（主线程分块渲染）
 ENGINE_TS = '''import { SONIC_PLAYER_SRC } from "./sonic-player-source";
-import { SONIC_WASM_B64 } from "./sonic-wasm";
+import { renderChunkFromChannels } from "./sonic-dsp";
 
 /**
  * 变速不变调 · 第五版
@@ -152,8 +152,108 @@ const PROCESSOR = "sonic-player";
 /** 一次渲染多少秒（越大 seek 后填充越慢，越小消息越频繁） */
 const CHUNK_SECONDS = 4;
 
-let wasmPromise: Promise<Record<string, any> | null> | null = null;
+// 变速渲染放在 Web Worker 里跑：主线程每 250ms 要补 4~6 秒音频，
+// 一次 Sonic 计算就是几十毫秒的主线程阻塞，浏览器随即丢帧 →「一卡一卡」。
+// 现在主线程只负责收发 PCM（postMessage + transfer），不做任何 DSP。
 let unavailable = false;
+let renderWorkerPromise: Promise<Worker | null> | null = null;
+let renderSeq = 0;
+const pendingRenders = new Map<
+	number,
+	(result: { left: Float32Array; right: Float32Array } | null) => void
+>();
+
+function getRenderWorker(): Promise<Worker | null> {
+	if (renderWorkerPromise) return renderWorkerPromise;
+	renderWorkerPromise = (async () => {
+		if (typeof window === "undefined" || typeof Worker === "undefined") {
+			return null;
+		}
+		try {
+			// 注意：Turbopack 打的 worker 引导用 importScripts（经典 worker），
+			// 这里不能传 { type: "module" }，否则运行时会直接抛错。
+			const worker = new Worker(
+				new URL("./sonic-render.worker.ts", import.meta.url),
+			);
+			worker.onmessage = (event: MessageEvent) => {
+				const data = (event.data ?? {}) as {
+					id?: number;
+					left?: ArrayBuffer;
+					right?: ArrayBuffer;
+				};
+				if (data.id === undefined) return;
+				const resolve = pendingRenders.get(data.id);
+				if (!resolve) return;
+				pendingRenders.delete(data.id);
+				resolve(
+					data.left && data.right
+						? { left: new Float32Array(data.left), right: new Float32Array(data.right) }
+						: null,
+				);
+			};
+			worker.onerror = () => {
+				// Worker 挂了退回主线程：先把挂起的请求全部放掉，否则渲染泵会一直等
+				failPendingRenders();
+				renderWorkerPromise = Promise.resolve(null);
+			};
+			return worker;
+		} catch (error) {
+			console.warn("[time-stretch] worker 创建失败，退回主线程渲染", error);
+			return null;
+		}
+	})();
+	return renderWorkerPromise;
+}
+
+function failPendingRenders(): void {
+	for (const resolve of pendingRenders.values()) resolve(null);
+	pendingRenders.clear();
+}
+
+async function renderChunkInWorker({
+	left,
+	right,
+	sampleRate,
+	startSample,
+	inFrames,
+	rate,
+}: {
+	left: Float32Array;
+	right: Float32Array;
+	sampleRate: number;
+	startSample: number;
+	inFrames: number;
+	rate: number;
+}): Promise<{ left: Float32Array; right: Float32Array } | null> {
+	const worker = await getRenderWorker();
+	if (!worker) return null;
+	const id = ++renderSeq;
+	// 只把需要的那一段拷成 transferable（AudioBuffer 里的原始数据要留着）
+	const sliceLeft = left.slice(startSample, startSample + inFrames);
+	const sliceRight = right.slice(startSample, startSample + inFrames);
+	return new Promise((resolve) => {
+		// 万一 worker 卡住，别把音频泵一起拖死：2 秒拿不到结果就走兜底
+		const timer = setTimeout(() => {
+			pendingRenders.delete(id);
+			resolve(null);
+		}, 2000);
+		pendingRenders.set(id, (result) => {
+			clearTimeout(timer);
+			resolve(result);
+		});
+		worker.postMessage(
+			{
+				type: "render",
+				id,
+				left: sliceLeft.buffer,
+				right: sliceRight.buffer,
+				sampleRate,
+				rate,
+			},
+			[sliceLeft.buffer, sliceRight.buffer],
+		);
+	});
+}
 
 export function isTimeStretchDisabled(): boolean {
 	if (typeof window === "undefined") return true;
@@ -178,23 +278,6 @@ export function shouldPreservePitch({
 	return !isTimeStretchDisabled();
 }
 
-async function getWasm(): Promise<Record<string, any> | null> {
-	if (unavailable) return null;
-	if (!wasmPromise) {
-		wasmPromise = (async () => {
-			try {
-				const bin = Uint8Array.from(atob(SONIC_WASM_B64), (c) => c.charCodeAt(0));
-				const { instance } = await WebAssembly.instantiate(bin.buffer, {});
-				return instance.exports as Record<string, any>;
-			} catch (error) {
-				unavailable = true;
-				console.warn("[time-stretch] wasm 载入失败", error);
-				return null;
-			}
-		})();
-	}
-	return wasmPromise;
-}
 
 /**
  * 从 buffer 的 startTime 处连续取 sourceFrames 帧，按 rate 变速（保音高），
@@ -211,71 +294,44 @@ export async function renderChunk({
 	sourceSeconds: number;
 	rate: number;
 }): Promise<{ left: Float32Array; right: Float32Array } | null> {
-	const wasm = await getWasm();
-	if (!wasm) return null;
-
 	const sampleRate = buffer.sampleRate;
 	const startSample = Math.max(0, Math.floor(startTime * sampleRate));
-	const endSample = Math.min(buffer.length, Math.ceil((startTime + sourceSeconds) * sampleRate));
+	const endSample = Math.min(
+		buffer.length,
+		Math.ceil((startTime + sourceSeconds) * sampleRate),
+	);
 	const inFrames = endSample - startSample;
 	if (inFrames <= 1) return null;
 
-	const stream = wasm.sonicCreateStream(sampleRate, 2);
-	if (!stream) return null;
-	wasm.sonicSetSpeed(stream, rate);
-	wasm.sonicSetPitch(stream, 1.0);
-
 	const leftSrc = buffer.getChannelData(0);
-	const rightSrc = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : leftSrc;
-	const outCap = Math.ceil(inFrames / rate) + sampleRate;
-	const outPtr = wasm.malloc(outCap * 2 * 4);
-	const inPtr = wasm.malloc(4096 * 2 * 4);
-	const chunks: Float32Array[] = [];
-	let total = 0;
+	const rightSrc =
+		buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : leftSrc;
 
-	const pull = () => {
-		let guard = 0;
-		while (guard++ < 32) {
-			const avail = wasm.sonicSamplesAvailable(stream);
-			if (avail <= 0) break;
-			const want = Math.min(avail, outCap);
-			const got = wasm.sonicReadFloatFromStream(stream, outPtr, want);
-			if (got <= 0) break;
-			chunks.push(new Float32Array(new Float32Array(wasm.memory.buffer, outPtr, got * 2)));
-			total += got;
-		}
-	};
+	// 首选 Worker：主线程只发消息，DSP 在后台线程算，画面不会因为补音频而丢帧。
+	const fromWorker = await renderChunkInWorker({
+		left: leftSrc,
+		right: rightSrc,
+		sampleRate,
+		startSample,
+		inFrames,
+		rate,
+	});
+	if (fromWorker) return fromWorker;
 
-	let pos = startSample;
-	while (pos < endSample) {
-		const n = Math.min(4096, endSample - pos);
-		const heap = new Float32Array(wasm.memory.buffer, inPtr, n * 2);
-		for (let i = 0; i < n; i++) {
-			heap[i * 2] = leftSrc[pos + i];
-			heap[i * 2 + 1] = rightSrc[pos + i];
-		}
-		wasm.sonicWriteFloatToStream(stream, inPtr, n);
-		pos += n;
-		pull();
+	// 兜底：Worker 不可用（老内核 / 被 CSP 拦掉）时才在主线程算
+	const local = await renderChunkFromChannels({
+		left: leftSrc,
+		right: rightSrc,
+		sampleRate,
+		startSample,
+		inFrames,
+		rate,
+	});
+	if (!local) {
+		unavailable = true;
+		return null;
 	}
-	wasm.sonicFlushStream(stream);
-	pull();
-
-	wasm.free(outPtr);
-	wasm.free(inPtr);
-	wasm.sonicDestroyStream(stream);
-
-	const left = new Float32Array(total);
-	const right = new Float32Array(total);
-	let offset = 0;
-	for (const chunk of chunks) {
-		for (let i = 0; i < chunk.length / 2; i++) {
-			left[offset + i] = chunk[i * 2];
-			right[offset + i] = chunk[i * 2 + 1];
-		}
-		offset += chunk.length / 2;
-	}
-	return { left, right };
+	return local;
 }
 
 /** 每次渲染覆盖的时间轴时长 */
@@ -369,6 +425,149 @@ if _am_txt:
         print("  patched audio-manager.ts (移除遗留 sonicVoices 字段)")
 
 print(f"Patching Sonic player into {ROOT}")
+# ------------------------------------------------------------ 纯 DSP（主线程/Worker 共用）
+DSP_TS = '''import { SONIC_WASM_B64 } from "./sonic-wasm";
+
+let wasmPromise: Promise<Record<string, any> | null> | null = null;
+
+export async function getSonicWasm(): Promise<Record<string, any> | null> {
+	if (!wasmPromise) {
+		wasmPromise = (async () => {
+			try {
+				const bin = Uint8Array.from(atob(SONIC_WASM_B64), (c) => c.charCodeAt(0));
+				const { instance } = await WebAssembly.instantiate(bin.buffer, {});
+				return instance.exports as Record<string, any>;
+			} catch (error) {
+				console.warn("[time-stretch] wasm 载入失败", error);
+				return null;
+			}
+		})();
+	}
+	return wasmPromise;
+}
+
+/**
+ * 纯计算：把 [startSample, startSample+inFrames) 这段立体声按 rate 变速（保音高）。
+ * Worker 和主线程共用同一份实现，两条路径逐样本一致。
+ */
+export async function renderChunkFromChannels({
+	left,
+	right,
+	sampleRate,
+	startSample,
+	inFrames,
+	rate,
+}: {
+	left: Float32Array;
+	right: Float32Array;
+	sampleRate: number;
+	startSample: number;
+	inFrames: number;
+	rate: number;
+}): Promise<{ left: Float32Array; right: Float32Array } | null> {
+	const wasm = await getSonicWasm();
+	if (!wasm) return null;
+	if (inFrames <= 1) return null;
+
+	const stream = wasm.sonicCreateStream(sampleRate, 2);
+	if (!stream) return null;
+	wasm.sonicSetSpeed(stream, rate);
+	wasm.sonicSetPitch(stream, 1.0);
+
+	const outCap = Math.ceil(inFrames / rate) + sampleRate;
+	const outPtr = wasm.malloc(outCap * 2 * 4);
+	const inPtr = wasm.malloc(4096 * 2 * 4);
+	const chunks: Float32Array[] = [];
+	let total = 0;
+
+	const pull = () => {
+		let guard = 0;
+		while (guard++ < 32) {
+			const avail = wasm.sonicSamplesAvailable(stream);
+			if (avail <= 0) break;
+			const want = Math.min(avail, outCap);
+			const got = wasm.sonicReadFloatFromStream(stream, outPtr, want);
+			if (got <= 0) break;
+			chunks.push(new Float32Array(new Float32Array(wasm.memory.buffer, outPtr, got * 2)));
+			total += got;
+		}
+	};
+
+	const endSample = startSample + inFrames;
+	let pos = startSample;
+	while (pos < endSample) {
+		const n = Math.min(4096, endSample - pos);
+		const heap = new Float32Array(wasm.memory.buffer, inPtr, n * 2);
+		for (let i = 0; i < n; i++) {
+			heap[i * 2] = left[pos - startSample + i];
+			heap[i * 2 + 1] = right[pos - startSample + i];
+		}
+		wasm.sonicWriteFloatToStream(stream, inPtr, n);
+		pos += n;
+		pull();
+	}
+	wasm.sonicFlushStream(stream);
+	pull();
+
+	wasm.free(outPtr);
+	wasm.free(inPtr);
+	wasm.sonicDestroyStream(stream);
+
+	const outLeft = new Float32Array(total);
+	const outRight = new Float32Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		for (let i = 0; i < chunk.length / 2; i++) {
+			outLeft[offset + i] = chunk[i * 2];
+			outRight[offset + i] = chunk[i * 2 + 1];
+		}
+		offset += chunk.length / 2;
+	}
+	return { left: outLeft, right: outRight };
+}
+'''
+
+# ------------------------------------------------------- Worker（只跑 DSP，不碰 DOM）
+WORKER_TS = '''import { renderChunkFromChannels } from "./sonic-dsp";
+
+const scope = self as unknown as {
+	onmessage: ((event: MessageEvent) => void) | null;
+	postMessage: (value: unknown, transfer?: Transferable[]) => void;
+};
+
+scope.onmessage = async (event: MessageEvent) => {
+	const data = (event.data ?? {}) as {
+		type?: string;
+		id?: number;
+		left?: ArrayBuffer;
+		right?: ArrayBuffer;
+		sampleRate?: number;
+		rate?: number;
+	};
+	if (data.type !== "render" || data.id === undefined) return;
+	const left = new Float32Array(data.left as ArrayBuffer);
+	const right = new Float32Array(data.right as ArrayBuffer);
+	const result = await renderChunkFromChannels({
+		left,
+		right,
+		sampleRate: data.sampleRate ?? 48000,
+		startSample: 0,
+		inFrames: left.length,
+		rate: data.rate ?? 1,
+	});
+	if (!result) {
+		scope.postMessage({ id: data.id });
+		return;
+	}
+	scope.postMessage(
+		{ id: data.id, left: result.left.buffer, right: result.right.buffer },
+		[result.left.buffer, result.right.buffer],
+	);
+};
+'''
+
+write(SRC / "lib" / "audio" / "sonic-dsp.ts", DSP_TS)
+write(SRC / "lib" / "audio" / "sonic-render.worker.ts", WORKER_TS)
 write(SRC / "lib" / "audio" / "sonic-engine.ts", ENGINE_TS)
 write(SRC / "lib" / "audio" / "sonic-player-source.ts", PLAYER_SRC_TS)
 
