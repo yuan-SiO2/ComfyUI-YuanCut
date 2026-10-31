@@ -87,6 +87,25 @@ async def _probe_streams(path: Path) -> set[str]:
     return kinds
 
 
+_ASSET_CHANNELS: dict[str, int] = {}
+
+
+async def _probe_audio_channels(path: Path) -> int:
+    """第一条音轨的声道数（0 = 没有音轨）。上混策略要用它，免得单声道被 -3 dB。"""
+    ffprobe = shutil.which("ffprobe") or "/usr/bin/ffprobe"
+    process = await asyncio.create_subprocess_exec(
+        ffprobe, "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=channels", "-of", "default=nw=1:nk=1",
+        str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await process.communicate()
+    try:
+        return int((out or b"0").decode().strip() or 0)
+    except ValueError:
+        return 0
+
+
 async def _probe_duration(path: Path) -> float:
     """读容器时长（秒）。分段渲染要靠它判断这一段是不是被截断。"""
     ffprobe = shutil.which("ffprobe") or "/usr/bin/ffprobe"
@@ -248,9 +267,13 @@ def _audio_chain(
                 rate, keep_pitch=_element_keeps_pitch(element)
             )
             delay = int(round(start * 1000))
+            # 单声道素材：显式 1.0 复制到左右（预览里 WebAudio 就是这么上混的）。
+            # 交给 aformat 自动上混会按 0.707/声道算，导出比预览整体低 3 dB。
+            upmix = "pan=stereo|c0=c0|c1=c0," if _ASSET_CHANNELS.get(asset_id or "") == 1 else ""
             parts.append(
                 f"[{stream}:a]atrim=start={trim_start:.3f}:duration={source_length:.3f},"
                 f"asetpts=PTS-STARTPTS,aresample={AUDIO_RATE},"
+                f"{upmix}"
                 f"{tempo + ',' if tempo else ''}"
                 f"volume={volume:.3f},"
                 f"adelay=delays={delay}:all=1[{label}]"
@@ -534,6 +557,7 @@ async def _prepare_inputs(
     caps: dict[str, set[str]] = {}
     for asset_id, path in paths.items():
         caps[asset_id] = await _probe_streams(path)
+        _ASSET_CHANNELS[asset_id] = await _probe_audio_channels(path)
     return inputs, input_args, caps
 
 async def _run_render_once(
