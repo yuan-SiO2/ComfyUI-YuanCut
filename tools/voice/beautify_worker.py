@@ -254,12 +254,16 @@ def dsp_enhance(x: np.ndarray, strength: float, makeup: float | None = None) -> 
 
 # ---------------------------------------------------------------------- 主流程
 
-def normalize_output(path: str, progress_path: str | None) -> None:
-    """把整段语音响度校正到 95 分位帧 RMS ≈ -20 dBFS，并保证峰值不超过 -1 dBFS。
+def normalize_output(
+    path: str, progress_path: str | None, target_rms: float | None = None
+) -> None:
+    """把整段语音响度校正到「源音频的语音电平」，并保证峰值不超过 -1 dBFS。
 
-    流式分块时补偿增益只能用源音频估算，块与块之间的整体电平会与目标有偏差，
-    这里再扫一遍成品统一校正（顺序读写，内存不随长度增长）。
+    以前固定拉齐到 -20 dBFS：源语音比它响的素材（很常见）会被整体压小，
+    听感就是「美化后人声小得多」，而配乐没变 → 人声被埋掉。
+    现在按源音频的 95 分位帧 RMS 对齐：美化只改音色，不改音量。
     """
+
     import soundfile as sf
 
     report(progress_path, "normalizing", 0.97)
@@ -278,13 +282,15 @@ def normalize_output(path: str, progress_path: str | None) -> None:
         return
 
     speech_rms = float(np.percentile(np.concatenate(levels), 95))
-    gain = float(np.clip((10 ** (-20.0 / 20.0)) / (speech_rms + 1e-12), 0.25, 8.0))
+    desired = float(target_rms) if target_rms and target_rms > 0 else 10 ** (-20.0 / 20.0)
+    # 这一步是「最后对齐一次」，不是逐块补偿：允许较大范围，否则对不齐
+    gain = float(np.clip(desired / (speech_rms + 1e-12), 0.2, 5.0))
     if abs(gain - 1.0) < 0.01:
         return
 
     temporary = f"{path}.norm"
     with sf.SoundFile(path, mode="r") as source, sf.SoundFile(
-        temporary, mode="w", samplerate=SR, channels=1, subtype="PCM_24", format="WAV"
+        temporary, mode="w", samplerate=SR, channels=2, subtype="PCM_24", format="WAV"
     ) as target:
         peak = 0.0
         while True:
@@ -293,7 +299,7 @@ def normalize_output(path: str, progress_path: str | None) -> None:
                 break
             scaled = (block * gain).astype(np.float32)
             peak = max(peak, float(np.max(np.abs(scaled))))
-            target.write(scaled)
+            target.write(np.repeat(scaled[:, None], 2, axis=1))
     # 归一化后可能顶到 0 dBFS，超过 -1 dBFS 再整体压一下
     if peak > 10 ** (-1.0 / 20.0) and peak > 0:
         scale = 10 ** (-1.0 / 20.0) / peak
@@ -301,7 +307,7 @@ def normalize_output(path: str, progress_path: str | None) -> None:
             f"{temporary}.lim",
             mode="w",
             samplerate=SR,
-            channels=1,
+            channels=2,
             subtype="PCM_24",
             format="WAV",
         ) as target:
@@ -309,7 +315,9 @@ def normalize_output(path: str, progress_path: str | None) -> None:
                 block = source.read(1 << 18, dtype="float32", always_2d=False)
                 if block.size == 0:
                     break
-                target.write((block * scale).astype(np.float32))
+                target.write(
+                    np.repeat((block * scale).astype(np.float32)[:, None], 2, axis=1)
+                )
         os.replace(f"{temporary}.lim", temporary)
     os.replace(temporary, path)
     log(f"[voice] 输出响度校正 x{gain:.2f}")
@@ -340,37 +348,42 @@ def run(
         hop_frames = chunk_frames - overlap_frames
 
 
-        # 全局补偿增益：扫一遍源音频算 95 分位帧 RMS，避免逐块各算造成响度跳变
-        global_makeup = None
-        if strength > 0:
-            frame = int(0.05 * SR)
-            frame_rms: list[np.ndarray] = []
-            scan = sf.SoundFile(str(decoded), mode="r")
-            try:
-                scan.seek(0)
-                while True:
-                    block = scan.read(frame * 200, dtype="float32", always_2d=False)
-                    if block.size == 0:
-                        break
-                    count = block.size // frame
-                    if count:
-                        chunked = block[: count * frame].reshape(count, frame)
-                        frame_rms.append(np.sqrt((chunked**2).mean(axis=1) + 1e-20))
-            finally:
-                scan.close()
-            if frame_rms:
-                speech_rms = float(np.percentile(np.concatenate(frame_rms), 95))
-                global_makeup = float(
-                    np.clip((10 ** (-20.0 / 20.0)) / (speech_rms + 1e-12), 0.5, 6.0)
-                )
-                log(f"[voice] 全局增益 x{global_makeup:.2f}")
+        # 扫一遍源音频算 95 分位帧 RMS：
+        #  · 给逐块补偿增益用，避免每块各算造成响度跳变
+        #  · 作为最终响度的对齐目标（美化只改音色，不改音量）
+        frame = int(0.05 * SR)
+        frame_rms: list[np.ndarray] = []
+        scan = sf.SoundFile(str(decoded), mode="r")
+        try:
+            scan.seek(0)
+            while True:
+                block = scan.read(frame * 200, dtype="float32", always_2d=False)
+                if block.size == 0:
+                    break
+                count = block.size // frame
+                if count:
+                    chunked = block[: count * frame].reshape(count, frame)
+                    frame_rms.append(np.sqrt((chunked**2).mean(axis=1) + 1e-20))
+        finally:
+            scan.close()
+        source_speech_rms = (
+            float(np.percentile(np.concatenate(frame_rms), 95)) if frame_rms else 0.0
+        )
+        # 补偿增益固定 1.0：美化后的电平最后统一按「源语音电平」对齐，
+        # 分块阶段不要再额外放大/压缩，否则块间会出现电平台阶。
+        global_makeup = 1.0 if source_speech_rms > 0 else None
+        if source_speech_rms > 0:
+            log(
+                f"[voice] 源语音电平 "
+                f"{20 * np.log10(max(source_speech_rms, 1e-9)):.1f} dBFS（输出将对齐到它）"
+            )
         source = sf.SoundFile(str(decoded), mode="r")
         total = len(source)
         tail: np.ndarray | None = None
         written = 0
 
         target = sf.SoundFile(
-            output_path, mode="w", samplerate=SR, channels=1, subtype="PCM_24"
+            output_path, mode="w", samplerate=SR, channels=2, subtype="PCM_24"
         )
         try:
             position = 0
@@ -405,7 +418,7 @@ def run(
                     position += hop_frames
 
                 if block.size:
-                    target.write(block)
+                    target.write(np.repeat(block[:, None], 2, axis=1))
                     written += block.size
 
                 del mixed
@@ -415,8 +428,8 @@ def run(
             source.close()
             target.close()
 
-    # 输出侧响度归一化：分块时补偿增益按整段源音频估算，最后统一校正一次
-    normalize_output(output_path, progress_path)
+    # 输出侧响度归一化：对齐到源语音电平（不改变整体音量，只改音色）
+    normalize_output(output_path, progress_path, target_rms=source_speech_rms)
 
     report(progress_path, "done", 1.0)
     log(

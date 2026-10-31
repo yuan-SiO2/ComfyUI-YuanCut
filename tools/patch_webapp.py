@@ -4526,6 +4526,22 @@ async function renderTimelineOnServer({
       throw new Error("项目时长为 0，没有可渲染内容");
     }
 
+    // 发给服务端的元素：整份拷过去，只丢掉浏览器侧对象（AudioBuffer / File / blob: url）。
+    // 以前是手挑字段，结果 volume、playbackRate 这些「后来才加的」字段永远漏发 →
+    // 导出按 1.0 音量、1 倍速处理，听感就是「导出还是原声音量」。
+    const toServerElement = (
+      element: Record<string, unknown>,
+    ): Record<string, unknown> => {
+      const copy: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(element)) {
+        if (value === undefined || typeof value === "function") continue;
+        if (key === "buffer" || key === "file") continue;
+        if (typeof value === "string" && value.startsWith("blob:")) continue;
+        copy[key] = value;
+      }
+      return copy;
+    };
+
     const serverTracks: { elements: Record<string, unknown>[] }[] = [];
 
     for (const track of tracks) {
@@ -4564,6 +4580,61 @@ async function renderTimelineOnServer({
             color: asText.color ?? "#ffffff",
             x: Math.round(asText.transform?.position?.x ?? 0),
             y: Math.round(asText.transform?.position?.y ?? 0),
+          });
+          continue;
+        }
+
+        const libraryAudio = element as {
+          sourceType?: string;
+          sourceUrl?: string;
+          trimStart?: number;
+          volume?: number;
+          muted?: boolean;
+          hidden?: boolean;
+        };
+
+        // 素材库/音效库的音频没有 mediaId（只有远端 sourceUrl）：
+        // 以前这里直接 continue，导出就静默少了整条音乐 —— 预览有、导出没有，
+        // 听感就是「导出声音小」。现在先下下来、按 URL 生成稳定 id 上传一次。
+        if (
+          !(element as { mediaId?: string }).mediaId &&
+          element.type === "audio" &&
+          libraryAudio.sourceUrl
+        ) {
+          if (libraryAudio.hidden || libraryAudio.muted) continue;
+          const url = libraryAudio.sourceUrl;
+          let hash = 5381;
+          for (let i = 0; i < url.length; i += 1) {
+            hash = ((hash * 33) ^ url.charCodeAt(i)) >>> 0;
+          }
+          const libraryAssetId = `lib${hash.toString(36)}${url.length.toString(36)}`;
+          if (!uploadedAssetIds.has(libraryAssetId)) {
+            const response = await fetch(url);
+            if (!response.ok) {
+              throw new Error(`素材库音频下载失败（HTTP ${response.status}）：${url}`);
+            }
+            const blob = await response.blob();
+            const guessed = url.split("?")[0].split(".").pop() || "mp3";
+            const ext = guessed.length <= 4 ? `.${guessed}` : ".mp3";
+            const ok = await uploadAssetBlob({
+              assetId: libraryAssetId,
+              blob,
+              ext,
+            });
+            if (!ok) throw new Error("素材库音频上传失败");
+            uploadedAssetIds.add(libraryAssetId);
+          }
+          const libraryVolume = libraryAudio.volume ?? 1;
+          elements.push({
+            ...toServerElement(element as unknown as Record<string, unknown>),
+            type: "audio",
+            assetId: libraryAssetId,
+            start,
+            duration: length,
+            trimStart: libraryAudio.trimStart ?? 0,
+            volume: libraryVolume,
+            playbackRate:
+              (element as { playbackRate?: number }).playbackRate ?? 1,
           });
           continue;
         }
@@ -4625,6 +4696,7 @@ async function renderTimelineOnServer({
             uploadedAssetIds.add(beautifyMediaId);
           }
           elements.push({
+            ...toServerElement(element as unknown as Record<string, unknown>),
             type: element.type,
             assetId: mediaId,
             muted: beautifyMediaId || visual.muted ? true : undefined,
@@ -4635,6 +4707,10 @@ async function renderTimelineOnServer({
             x: Math.round(visual.transform?.position?.x ?? 0),
             y: Math.round(visual.transform?.position?.y ?? 0),
             opacity: visual.opacity ?? 1,
+            // 画面自带的音轨：音量和倍速都要带，否则导出永远按 1.0 / 1×
+            volume: (element as { volume?: number }).volume ?? 1,
+            playbackRate:
+              (element as { playbackRate?: number }).playbackRate ?? 1,
           });
           if (beautifyMediaId) {
             elements.push({
@@ -4643,7 +4719,8 @@ async function renderTimelineOnServer({
               start,
               duration: length,
               trimStart: visual.trimStart ?? 0,
-              volume: 1,
+              // 人声美化只换音源，不改音量：沿用视频片段设的音量
+              volume: (element as { volume?: number }).volume ?? 1,
               playbackRate: beautify.playbackRate ?? 1,
             });
           }
@@ -4656,12 +4733,15 @@ async function renderTimelineOnServer({
           };
           if (audio.hidden || audio.muted) continue;
           elements.push({
+            ...toServerElement(element as unknown as Record<string, unknown>),
             type: "audio",
             assetId: mediaId,
             start,
             duration: length,
             trimStart: audio.trimStart ?? 0,
             volume: audio.volume ?? 1,
+            playbackRate:
+              (element as { playbackRate?: number }).playbackRate ?? 1,
           });
         }
       }
@@ -5484,6 +5564,151 @@ write(EXPORT_BUTTON, EXPORT_BUTTON_SOURCE + "\n")
 print("  wrote   export-button.tsx（三段式导出面板）")
 
 print("  patched 三段式导出面板（视频 / 音频 / 字幕）")
+# --------------------------- 导出任务提到模块作用域：关面板 = 不打断导出
+# 导出面板是 Radix Dialog：点面板外面 / 按 Esc 就会关闭并**卸载**整个面板，
+# 任务状态（进度、结果、目录句柄）全在组件里 → 一关就“被打断”。
+# 这里把任务快照和取消标记放到模块作用域，组件只做展示与订阅：
+#   · 关掉面板不影响正在跑的导出，重新打开会接着显示当前进度 / 结果
+#   · 导出进行中点外面 / 按 Esc 不再关闭面板（要停只能点「取消」）
+_eb_src = EXPORT_BUTTON.read_text(encoding="utf-8")
+
+_export_store = (
+    "type ExportJobSnapshot = {\n"
+    "\trunning: boolean;\n"
+    "\tprogress: number;\n"
+    "\tresult: ExportResult | null;\n"
+    "\tsavedPaths: string[];\n"
+    "};\n"
+    "\n"
+    "/** 导出任务状态：放在模块作用域，面板关掉也不丢 */\n"
+    "const exportJob: ExportJobSnapshot = {\n"
+    "\trunning: false,\n"
+    "\tprogress: 0,\n"
+    "\tresult: null,\n"
+    "\tsavedPaths: [],\n"
+    "};\n"
+    "const exportJobCancel = { current: false };\n"
+    "const exportJobListeners = new Set<() => void>();\n"
+    "\n"
+    "function updateExportJob(patch: Partial<ExportJobSnapshot>): void {\n"
+    "\tObject.assign(exportJob, patch);\n"
+    "\tfor (const listener of exportJobListeners) listener();\n"
+    "}\n"
+    "\n"
+    "function useExportJob(): ExportJobSnapshot {\n"
+    "\tconst [, force] = useReducer((x: number) => x + 1, 0);\n"
+    "\tuseEffect(() => {\n"
+    "\t\texportJobListeners.add(force);\n"
+    "\t\treturn () => {\n"
+    "\t\t\texportJobListeners.delete(force);\n"
+    "\t\t};\n"
+    "\t}, []);\n"
+    "\treturn exportJob;\n"
+    "}\n"
+    "\n"
+    "function ExportDialog({\n"
+)
+assert _eb_src.count("function ExportDialog({\n") == 1
+_eb_src = _eb_src.replace("function ExportDialog({\n", _export_store, 1)
+
+_eb_src = _eb_src.replace(
+    'import { useEffect, useRef, useState } from "react";',
+    'import { useEffect, useReducer, useRef, useState } from "react";',
+    1,
+)
+
+# 组件里改成「读快照 + 同名 setter 包装」，其它调用点一个字都不用动
+_local_states = (
+    "\tconst [isExporting, setIsExporting] = useState(false);\n"
+    "\tconst [savedPaths, setSavedPaths] = useState<string[]>([]);\n"
+)
+assert _eb_src.count(_local_states) == 1
+_eb_src = _eb_src.replace(
+    _local_states,
+    "\tconst job = useExportJob();\n"
+    "\tconst isExporting = job.running;\n"
+    "\tconst progress = job.progress;\n"
+    "\tconst exportResult = job.result;\n"
+    "\tconst savedPaths = job.savedPaths;\n"
+    "\tconst setIsExporting = (value: boolean) => updateExportJob({ running: value });\n"
+    "\tconst setProgress = (value: number) => updateExportJob({ progress: value });\n"
+    "\tconst setExportResult = (value: ExportResult | null) =>\n"
+    "\t\tupdateExportJob({ result: value });\n"
+    "\tconst setSavedPaths = (value: string[]) =>\n"
+    "\t\tupdateExportJob({ savedPaths: value });\n",
+    1,
+)
+
+_dup_states = (
+    "\tconst [progress, setProgress] = useState(0);\n"
+    "\tconst [exportResult, setExportResult] = useState<ExportResult | null>(null);\n"
+    "\tconst cancelRequestedRef = useRef(false);\n"
+)
+assert _eb_src.count(_dup_states) == 1
+_eb_src = _eb_src.replace(_dup_states, "\tconst cancelRequestedRef = exportJobCancel;\n", 1)
+
+# 挂载时的复位不能把正在跑的任务状态清掉
+_mount_reset = (
+    "\t// 挂载时兜底复位：避免上一次异常中断把 isExporting 留在 true\n"
+    "\tuseEffect(() => {\n"
+    "\t\tsetIsExporting(false);\n"
+    "\t\tcancelRequestedRef.current = false;\n"
+    "\t}, []);\n"
+)
+assert _eb_src.count(_mount_reset) == 1
+_eb_src = _eb_src.replace(
+    _mount_reset,
+    "\t// 挂载时只在「没有正在跑的导出」时复位取消标记\n"
+    "\tuseEffect(() => {\n"
+    "\t\tif (!exportJob.running) cancelRequestedRef.current = false;\n"
+    "\t}, []);\n",
+    1,
+)
+
+_open_reset = (
+    "\t\tsetExportResult(null);\n"
+    "\t\tsetSavedPaths([]);\n"
+    "\t\tsetProgress(0);\n"
+    "\t\tsetIsExporting(false);          // 上次异常中断可能留下 true\n"
+    "\t\tcancelRequestedRef.current = false;\n"
+)
+assert _eb_src.count(_open_reset) == 1
+_eb_src = _eb_src.replace(
+    _open_reset,
+    "\t\t// 有导出在跑就保留进度，重新打开面板接着看；没有才清空\n"
+    "\t\tif (exportJob.running) return;\n"
+    "\t\tsetExportResult(null);\n"
+    "\t\tsetSavedPaths([]);\n"
+    "\t\tsetProgress(0);\n"
+    "\t\tcancelRequestedRef.current = false;\n",
+    1,
+)
+
+# 导出进行中：点外面 / Esc 都不许关面板（要停只能点「取消」）
+_dialog_open = (
+    '\t\t<DialogContent className="max-h-[85vh] w-[min(560px,92vw)] gap-0 overflow-hidden p-0">'
+)
+assert _eb_src.count(_dialog_open) == 1
+_eb_src = _eb_src.replace(
+    _dialog_open,
+    '\t\t<DialogContent\n'
+    '\t\t\tclassName="max-h-[85vh] w-[min(560px,92vw)] gap-0 overflow-hidden p-0"\n'
+    "\t\t\tonPointerDownOutside={(event) => {\n"
+    "\t\t\t\tif (isExporting) event.preventDefault();\n"
+    "\t\t\t}}\n"
+    "\t\t\tonInteractOutside={(event) => {\n"
+    "\t\t\t\tif (isExporting) event.preventDefault();\n"
+    "\t\t\t}}\n"
+    "\t\t\tonEscapeKeyDown={(event) => {\n"
+    "\t\t\t\tif (isExporting) event.preventDefault();\n"
+    "\t\t\t}}\n"
+    "\t\t>",
+    1,
+)
+
+EXPORT_BUTTON.write_text(_eb_src, encoding="utf-8")
+print("  patched export-button.tsx（导出任务提到模块作用域，关面板不打断）")
+
 
 # ------------------------------------------------ 字幕转录改用 MOSS-Transcribe-Diarize
 # 原来字幕转录在浏览器里跑 Whisper（Small / Large v3 Turbo / Distil Small）三个模型。

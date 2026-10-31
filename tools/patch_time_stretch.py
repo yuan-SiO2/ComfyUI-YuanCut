@@ -66,59 +66,10 @@ wasm_module = build_wasm_module()
 if wasm_module:
     write(SRC / "lib" / "audio" / "sonic-wasm.ts", wasm_module)
 
-# ------------------------------------------------- 导出：请求里带上倍速
-EXPORT_BUTTON = SRC / "components" / "editor" / "export-button.tsx"
-patch(
-    EXPORT_BUTTON,
-    "\t\t\t\t\tconst visual = element as unknown as {\n"
-    "\t\t\t\t\t\thidden?: boolean;\n"
-    "\t\t\t\t\t\tmuted?: boolean;\n"
-    "\t\t\t\t\t\topacity?: number;\n"
-    "\t\t\t\t\t\ttrimStart?: number;\n"
-    "\t\t\t\t\t\ttransform?: { position?: { x: number; y: number }; scale?: number };\n"
-    "\t\t\t\t\t};",
-    "\t\t\t\t\tconst visual = element as unknown as {\n"
-    "\t\t\t\t\t\thidden?: boolean;\n"
-    "\t\t\t\t\t\tmuted?: boolean;\n"
-    "\t\t\t\t\t\topacity?: number;\n"
-    "\t\t\t\t\t\ttrimStart?: number;\n"
-    "\t\t\t\t\t\tplaybackRate?: number;\n"
-    "\t\t\t\t\t\ttransform?: { position?: { x: number; y: number }; scale?: number };\n"
-    "\t\t\t\t\t};",
-)
-patch(
-    EXPORT_BUTTON,
-    "\t\t\t\t\t\topacity: visual.opacity ?? 1,\n\t\t\t\t\t});",
-    "\t\t\t\t\t\topacity: visual.opacity ?? 1,\n"
-    "\t\t\t\t\t\tplaybackRate: visual.playbackRate ?? 1,\n"
-    "\t\t\t\t\t});",
-)
-patch(
-    EXPORT_BUTTON,
-    "\t\t\t\t\tconst audio = element as unknown as {\n"
-    "\t\t\t\t\t\thidden?: boolean;\n"
-    "\t\t\t\t\t\tmuted?: boolean;\n"
-    "\t\t\t\t\t\tvolume?: number;\n"
-    "\t\t\t\t\t\ttrimStart?: number;\n"
-    "\t\t\t\t\t};",
-    "\t\t\t\t\tconst audio = element as unknown as {\n"
-    "\t\t\t\t\t\thidden?: boolean;\n"
-    "\t\t\t\t\t\tmuted?: boolean;\n"
-    "\t\t\t\t\t\tvolume?: number;\n"
-    "\t\t\t\t\t\ttrimStart?: number;\n"
-    "\t\t\t\t\t\tplaybackRate?: number;\n"
-    "\t\t\t\t\t};",
-)
-patch(
-    EXPORT_BUTTON,
-    "\t\t\t\t\t\ttrimStart: audio.trimStart ?? 0,\n"
-    "\t\t\t\t\t\tvolume: audio.volume ?? 1,\n"
-    "\t\t\t\t\t});",
-    "\t\t\t\t\t\ttrimStart: audio.trimStart ?? 0,\n"
-    "\t\t\t\t\t\tvolume: audio.volume ?? 1,\n"
-    "\t\t\t\t\t\tplaybackRate: audio.playbackRate ?? 1,\n"
-    "\t\t\t\t\t});",
-)
+# ------------------------------------------------- 导出：请求里带上倍速 / 音量
+# 说明：这段「手挑字段」的补丁已由 patch_webapp.py 统一接管
+# （payload 现在整份继承元素，并显式带上 volume / playbackRate），
+# 留在这里会和新结构对不上，所以整段去掉。
 
 if not wasm_module:
     print("Done. time-stretch skipped (no wasm).")
