@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -88,6 +89,9 @@ async def _probe_streams(path: Path) -> set[str]:
 
 
 _ASSET_CHANNELS: dict[str, int] = {}
+# 素材容器时长（秒）：片段比剩余素材长时要用它算「补多少帧」
+_ASSET_DURATION: dict[str, float] = {}
+_FONT_FILE_CACHE: dict[str, str] = {}
 
 
 async def _probe_audio_channels(path: Path) -> int:
@@ -142,6 +146,21 @@ def _asset_path(asset_id: str) -> Path | None:
             return candidate
 
     return None
+
+
+def _frame_time(seconds: float, fps: int) -> float:
+    """把时间点对齐到输出帧网格。
+
+    片段的 start 常常不在帧边界上（2.3667s @30fps = 第 71.001 帧）。
+    overlay 的 enable 按秒判断：2.366667 < 2.3667，于是边界那一帧仍然
+    显示上一段，新片段的首帧被推后一帧 —— 观感就是「切的时候闪一下」。
+    统一对齐到最近的帧，边界帧就归新片段（后画的那一层覆盖）。
+    """
+    if fps <= 0:
+        return seconds
+    # 1e-4 秒的余量：71/30 = 2.3666666…，字符串化后 2.366667 会略大于帧时间，
+    # 边界那一帧就又被判成「还没开始」。减掉一点点，边界帧稳定归新片段。
+    return max(0.0, round(seconds * fps) / fps - 1e-4)
 
 
 def _num(value, default: float = 0.0) -> float:
@@ -330,8 +349,15 @@ def _build_filter(
     index = 0
 
     tracks = timeline.get("tracks") or []
+    # 画面元素按开始时间排序：相邻片段在边界那一帧会重叠 1 帧（下面 enable 里 +1.5 帧），
+    # 后画的必须是「后开始的片段」，否则边界帧会被上一段的末帧盖住。
+    _visual_elements = []
     for track in tracks:
         for element in track.get("elements") or []:
+            _visual_elements.append(element)
+    _visual_elements.sort(key=lambda item: _num(item.get("start")))
+    for element in _visual_elements:
+        if True:
             if element.get("hidden"):
                 continue
             kind = element.get("type")
@@ -340,15 +366,17 @@ def _build_filter(
             if length <= 0:
                 continue
 
+            # 对齐到输出帧网格：边界帧归新片段，不再晚一帧
+            start_q = _frame_time(start, fps)
             if kind == "color":
                 color = str(element.get("color") or "#000000").replace("#", "0x")
                 parts.append(
                     f"color=c={color}:s={width}x{height}:r={fps}:d={length:.3f}"
-                    f",setpts=PTS-STARTPTS+{start:.3f}/TB[c{index}]"
+                    f",setpts=PTS-STARTPTS+{start_q:.6f}/TB[c{index}]"
                 )
                 parts.append(
                     f"[{current}][c{index}]overlay=0:0:eof_action=pass"
-                    f":enable='between(t,{start:.3f},{start + length:.3f})'[o{index}]"
+                    f":enable='between(t,{start_q:.6f},{_frame_time(start + length, fps):.6f})'[o{index}]"
                 )
                 current = f"o{index}"
                 index += 1
@@ -382,16 +410,26 @@ def _build_filter(
             source_length = length * rate if rate != 1.0 else length
             if rate != 1.0:
                 timing = (
-                    f"setpts=(PTS-STARTPTS)/{rate:.6f}+{start:.3f}/TB,fps={fps}"
+                    f"setpts=(PTS-STARTPTS)/{rate:.6f}+{start_q:.6f}/TB,fps={fps}"
                 )
             else:
-                timing = f"setpts=PTS-STARTPTS+{start:.3f}/TB"
+                timing = f"setpts=PTS-STARTPTS+{start_q:.6f}/TB,fps={fps}"
             # 先把素材按画布「铺满再居中裁切」（与预览的 cover 一致），
             # 再套用户的 transform 缩放。之前只做 transform 缩放，
             # 素材原始尺寸和画布不一致时就会被 overlay 裁掉/缩小。
+            # 片段比素材剩余长度长时：预览里 <video> 会停在最后一帧，
+            # 导出以前是 overlay 结束 → 露黑底，成了「片段之间的黑闪」。
+            # 这里用 tpad 克隆末帧补满，两边一致。
+            media_duration = _ASSET_DURATION.get(asset_id or "", 0.0)
+            available = max(0.0, media_duration - trim_start) / max(rate, 1e-6)
+            # 永远多留 1.5 帧末帧：片段边界那一帧由上一段的末帧兜住，
+            # 等下一段解出第一帧再交棒，导出就不会出现「一帧黑」。
+            hold = max(0.0, length - available) + 1.5 / max(1, fps)
+            hold_filter = f"tpad=stop_mode=clone:stop_duration={hold:.3f},"
             parts.append(
                 f"[{stream}:v]trim=start={trim_start:.3f}:duration={source_length:.3f},"
                 f"{timing},"
+                f"{hold_filter}"
                 # 与预览一致：按「适应画面」缩放（不裁切），黑边由底图透出来；
                 # 之前用 increase+crop 是「铺满裁切」，素材比例和画布不同时就会
                 # 看起来被放大/裁掉一截。
@@ -410,7 +448,7 @@ def _build_filter(
             parts.append(
                 f"[{current}][{label}]overlay="
                 f"x=(W-w)/2+{pos_x * sxs:.1f}:y=(H-h)/2+{pos_y * sys_:.1f}"
-                f":eof_action=pass:enable='between(t,{start:.3f},{start + length:.3f})'"
+                f":eof_action=pass:enable='between(t,{start_q:.6f},{start_q + length + 1.5 / max(1, fps):.6f})'"
                 f"[o{index}]"
             )
             current = f"o{index}"
@@ -430,23 +468,49 @@ def _build_filter(
             if length <= 0:
                 continue
 
+            start_q = _frame_time(start, fps)
             # 应用里的 fontSize 是相对值（字幕默认 5），按画布高度换算成像素
             relative_size = _num(element.get("fontSize"), 5) or 5
             font_size = max(8, round(relative_size * height / FONT_SIZE_SCALE_REFERENCE))
-            # 按画布宽度换行，避免切比例后字幕横向溢出画面
+
+            # 字体族 / 粗细 / 斜体：预览用 canvas 的 "bold italic Npx Family"，
+            # 导出必须用同一个族名，否则字形和宽度都不一样（字幕「样式不一致」）。
+            family = str(element.get("fontFamily") or "").strip() or "sans"
+            weight = str(element.get("fontWeight") or "normal")
+            style = str(element.get("fontStyle") or "normal")
+            font_file = _resolve_font_file(
+                family,
+                bold=weight == "bold",
+                italic=style == "italic",
+                text=content,
+            )
+            font_arg = (
+                "fontfile='{}'".format(font_file.replace("'", "'\\''"))
+                if font_file
+                else "font={}".format(family.replace(":", " "))
+            )
+
+            # 换行宽度：有 boxWidth 就按它（预览也是按它换行），否则占画面 90%
+            box_width = _num(element.get("boxWidth"), 0)
+            wrap_width = (
+                box_width * (height / FONT_SIZE_SCALE_REFERENCE)
+                if box_width > 0
+                else max(16.0, width * 0.90)
+            )
             lines = _wrap_text_for_canvas(
                 text=content,
                 font_size=font_size,
-                max_width=max(16.0, width * 0.90),
+                max_width=max(16.0, min(wrap_width, width * 0.98)),
             )
             text_file = _write_text_file("\n".join(lines))
             color = str(element.get("color") or "#ffffff")
             if not color.startswith("#"):
                 color = "#ffffff"
+
+            block_height = font_size * 1.3 * len(lines)
             pos_x = int(width / 2 + _num(element.get("x")) * sxs)
             pos_y = int(height / 2 + _num(element.get("y")) * sys_)
             # 文本块垂直夹紧，保证不出画面
-            block_height = font_size * 1.3 * len(lines)
             if block_height * 2 <= height:
                 pos_y = max(
                     int(block_height / 2),
@@ -455,12 +519,24 @@ def _build_filter(
             else:
                 pos_y = int(height / 2)
 
+            # 对齐方式与基线：预览里字幕用 textBaseline=bottom，正文用 middle
+            align = str(element.get("textAlign") or "center")
+            bottom_aligned = bool(element.get("bottomAligned"))
+            if align == "left":
+                x_expr = f"{pos_x}"
+            elif align == "right":
+                x_expr = f"{pos_x}-text_w"
+            else:
+                x_expr = f"{pos_x}-text_w/2"
+            y_expr = f"{pos_y}-text_h" if bottom_aligned else f"{pos_y}-text_h/2"
+
             parts.append(
                 f"[{current}]drawtext=textfile='{text_file}'"
+                f":{font_arg}"
                 f":fontsize={font_size}:fontcolor={color}"
                 f":line_spacing={max(2, round(font_size * 0.3))}"
-                f":x={pos_x}-text_w/2:y={pos_y}-text_h/2"
-                f":enable='between(t,{start:.3f},{start + length:.3f})'[t{text_index}]"
+                f":x={x_expr}:y={y_expr}"
+                f":enable='between(t,{start_q:.6f},{start_q + length:.6f})'[t{text_index}]"
             )
             current = f"t{text_index}"
             text_index += 1
@@ -520,6 +596,158 @@ def _wrap_text_for_canvas(
     return lines or [""]
 
 
+def _charset_spec(text: str) -> str:
+    """把文本里出现的码点拼成 fontconfig 的 charset 查询串。"""
+    points = sorted({ord(ch) for ch in text if not ch.isspace()})
+    return ",".join(f"{cp:x}" for cp in points[:200])
+
+def _models_root() -> Path:
+    try:
+        import folder_paths  # type: ignore
+
+        return Path(folder_paths.models_dir)
+    except Exception:  # pragma: no cover
+        return Path(__file__).resolve().parent.parent / "models"
+
+
+def _ext_font_file(family: str) -> str | None:
+    """ext 素材库（可选扩展）里的字体文件。
+
+    扩展把字体下载到 models/Yuan_Cut/sucai/font/，清单里记着字体名；
+    浏览器用 @font-face 注册这些字体，系统 fontconfig 里并没有，
+    所以导出必须从这里取文件，否则 drawtext 只能退回默认字体
+    （表现就是「预览换了字体、导出没变」）。
+    扩展没装（ext/ 不存在）时返回 None，导出照旧走 fontconfig。
+    """
+    name = (family or "").strip()
+    if not name:
+        return None
+    try:
+        ext_dir = Path(__file__).resolve().parent / "ext"
+        catalog = ext_dir / "catalog" / "fonts.json"
+        if not catalog.is_file():
+            return None
+        items = json.loads(catalog.read_text(encoding="utf-8"))
+        if not isinstance(items, list):
+            return None
+        font_id = ""
+        for item in items:
+            if (item.get("name") or "").strip() == name:
+                font_id = str(item.get("id") or "")
+                break
+        if not font_id:
+            return None
+        root = _models_root() / "Yuan_Cut" / "sucai"
+        index = root / "index.json"
+        if not index.is_file():
+            return None
+        data = json.loads(index.read_text(encoding="utf-8"))
+        entry = (data.get("items") or {}).get(f"font:{font_id}") or {}
+        file_name = str(entry.get("file") or "")
+        if not file_name:
+            return None
+        path = root / file_name
+        if not path.is_file():
+            # 记录里可能是 "font/<id>/<file>"，也可能只是文件名
+            path = root / "font" / Path(file_name).name
+        return str(path) if path.is_file() else None
+    except Exception as exc:  # pragma: no cover - 扩展缺失/清单损坏时静默退回
+        logger.debug("[YuanCut] ext 字体解析失败：%s", exc)
+        return None
+
+
+
+def _resolve_font_file(
+    family: str, bold: bool, italic: bool, text: str = ""
+) -> str:
+    """把「族名 + 粗细/斜体 + 这段文字」解析成字体文件路径（fc-match）。
+
+    关键点：必须按**文字实际用到的码点**选字体。
+    之前只按族名匹配（DejaVu Sans），中文没有字形 → 导出正文全变成方框（tofu）。
+    浏览器 canvas 会自动回退到中文字体，drawtext 用 fontfile 不会回退，所以这里要自己选对。
+    """
+    key = f"{family}|{int(bold)}|{int(italic)}|{_charset_spec(text)}"
+    cached = _FONT_FILE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # ext 素材库的字体：浏览器里用 @font-face 注册，系统 fontconfig 里没有，
+    # 不先查这条路径，导出就会退回默认字体（预览换了、导出没换）。
+    ext_file = _ext_font_file(family)
+    if ext_file and _font_covers(ext_file, text):
+        _FONT_FILE_CACHE[key] = ext_file
+        return ext_file
+
+    weight = "200" if bold else "80"  # fontconfig: bold=200, regular=80
+    slant = "100" if italic else "0"
+    charset = _charset_spec(text)
+    candidates: list[str] = []
+    if family:
+        candidates.append(f"{family}:weight={weight}:slant={slant}")
+        if charset:
+            candidates.append(f"{family}:charset={charset}")
+    if charset:
+        # 族名没有这些字形（比如中文字幕配 DejaVu Sans）时，直接按码点找覆盖它的字体
+        candidates.append(f":charset={charset}:weight={weight}:slant={slant}")
+        candidates.append(f":lang=zh-cn:charset={charset}")
+    candidates.append(f"{family or 'sans'}")
+
+    resolved = ""
+    for pattern in candidates:
+        try:
+            probe = subprocess.run(
+                ["fc-match", "-f", "%{file}", pattern],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:  # pragma: no cover - 没有 fontconfig 时退回族名
+            continue
+        candidate = (probe.stdout or "").strip()
+        if not candidate or not Path(candidate).is_file():
+            continue
+        # 不管是族名还是 charset 查询，都必须真的覆盖这段文字的全部字形：
+        # 否则中文会用拉丁字体渲染成一排方框（tofu）。
+        if not _font_covers(candidate, text):
+            continue
+        resolved = candidate
+        break
+    _FONT_FILE_CACHE[key] = resolved
+    return resolved
+
+
+def _font_covers(path: str, text: str) -> bool:
+    """这个字体文件是否覆盖文本里所有非空白字符。"""
+    points = sorted({ord(ch) for ch in text if not ch.isspace()})
+    if not points:
+        return True
+    try:
+        probe = subprocess.run(
+            ["fc-query", "-f", "%{charset}", path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return True
+    spec = (probe.stdout or "").strip()
+    if not spec:
+        return True
+    ranges: set[int] = set()
+    for part in spec.split():
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            try:
+                ranges.update(range(int(lo, 16), int(hi, 16) + 1))
+            except ValueError:
+                continue
+        else:
+            try:
+                ranges.add(int(part, 16))
+            except ValueError:
+                continue
+    return all(cp in ranges for cp in points)
+
+
 def _write_text_file(text: str) -> str:
     handle = tempfile.NamedTemporaryFile(
         "w", suffix=".txt", delete=False, encoding="utf-8"
@@ -558,6 +786,7 @@ async def _prepare_inputs(
     for asset_id, path in paths.items():
         caps[asset_id] = await _probe_streams(path)
         _ASSET_CHANNELS[asset_id] = await _probe_audio_channels(path)
+        _ASSET_DURATION[asset_id] = await _probe_duration(path)
     return inputs, input_args, caps
 
 async def _run_render_once(

@@ -4580,6 +4580,18 @@ async function renderTimelineOnServer({
             color: asText.color ?? "#ffffff",
             x: Math.round(asText.transform?.position?.x ?? 0),
             y: Math.round(asText.transform?.position?.y ?? 0),
+            // 样式/对齐/基线：预览是 canvas 画的，导出必须拿到同一套参数
+            fontFamily:
+              (element as { fontFamily?: string }).fontFamily ?? "sans",
+            fontWeight:
+              (element as { fontWeight?: string }).fontWeight ?? "normal",
+            fontStyle: (element as { fontStyle?: string }).fontStyle ?? "normal",
+            textAlign: (element as { textAlign?: string }).textAlign ?? "center",
+            boxWidth: (element as { boxWidth?: number }).boxWidth ?? 0,
+            // 预览里字幕（name 是 "subtitle"/"Caption N"）用 textBaseline=bottom
+            bottomAligned: isBottomAlignedSubtitleText({
+              element: element as never,
+            }),
           });
           continue;
         }
@@ -5613,7 +5625,8 @@ _eb_src = _eb_src.replace("function ExportDialog({\n", _export_store, 1)
 
 _eb_src = _eb_src.replace(
     'import { useEffect, useRef, useState } from "react";',
-    'import { useEffect, useReducer, useRef, useState } from "react";',
+    'import { useEffect, useReducer, useRef, useState } from "react";\n'
+    'import { isBottomAlignedSubtitleText } from "@/lib/timeline/text-utils";',
     1,
 )
 
@@ -8637,7 +8650,331 @@ export default AudioWaveform;
 print(f"  wrote {AUDIO_WAVEFORM_FILE.relative_to(ROOT)} (波形按裁剪窗口显示)")
 
 
+# ------------------------------- 素材/音频「已添加」标记（可重复添加，但要能看到已用）
+# --------------------------- 时间轴：拖拽/选中更跟手（拖动前先选中 + 加宽缩放手柄）
+ELEMENT_INTERACTION = SRC / "hooks" / "timeline" / "element" / "use-element-interaction.ts"
+_ei = ELEMENT_INTERACTION.read_text(encoding="utf-8")
+if "拖动过程中也要保持选中" not in _ei:
+    _ei = _ei.replace(
+        "\t\t\t// start drag\n"
+        "\t\t\tconst clickOffsetTime = getClickOffsetTime({\n",
+        "\t\t\t// 拖动过程中也要保持选中：以前只有 mouseup 后的 click 才选中，\n"
+        "\t\t\t// 手一抖超过 5px 就变成拖动、click 被吃掉 → 感觉「点不中、拖不动」\n"
+        "\t\t\tif (\n"
+        "\t\t\t\t!isMultiSelect &&\n"
+        "\t\t\t\t!isElementSelected({ trackId: track.id, elementId: element.id })\n"
+        "\t\t\t) {\n"
+        "\t\t\t\thandleSelectionClick({\n"
+        "\t\t\t\t\ttrackId: track.id,\n"
+        "\t\t\t\t\telementId: element.id,\n"
+        "\t\t\t\t\tisMultiKey: false,\n"
+        "\t\t\t\t});\n"
+        "\t\t\t}\n"
+        "\n"
+        "\t\t\t// start drag\n"
+        "\t\t\tconst clickOffsetTime = getClickOffsetTime({\n",
+        1,
+    )
+    ELEMENT_INTERACTION.write_text(_ei, encoding="utf-8")
+    print(f"  patched {ELEMENT_INTERACTION.relative_to(ROOT)} (拖动前先选中)")
+
+TIMELINE_ELEMENT_FILE = SRC / "components" / "editor" / "panels" / "timeline" / "timeline-element.tsx"
+_te2 = TIMELINE_ELEMENT_FILE.read_text(encoding="utf-8")
+if "w-[0.9rem]" not in _te2:
+    # 缩放手柄 0.6rem → 0.9rem：手指/鼠标更容易抓到边
+    _te2 = _te2.replace(
+        "flex w-[0.6rem] items-center justify-center",
+        "flex w-[0.9rem] items-center justify-center",
+        1,
+    )
+    TIMELINE_ELEMENT_FILE.write_text(_te2, encoding="utf-8")
+    print(f"  patched {TIMELINE_ELEMENT_FILE.relative_to(ROOT)} (缩放手柄加宽)")
+
+# ------------------------------ 文本选中框 = 与绘制同源的整块排版
+# 以前：未换行宽度 + 固定 1.4 倍字号估算，且没算 TextNode 的「垂直夹紧」「textAlign 锚点」，
+# 于是框和字对不上：多行字幕溢出框、拖到底部时字被夹上去框却不动、左对齐偏半个字宽。
+TEXT_NODE_FILE = SRC / "services" / "renderer" / "nodes" / "text-node.ts"
+_tn = TEXT_NODE_FILE.read_text(encoding="utf-8")
+if "layoutTextBlock" not in _tn:
+    _tn = _tn.replace(
+        'import { FONT_SIZE_SCALE_REFERENCE } from "@/constants/text-constants";',
+        'import { FONT_SIZE_SCALE_REFERENCE } from "@/constants/text-constants";\n'
+        'import { isBottomAlignedSubtitleText } from "@/lib/timeline/text-utils";',
+        1,
+    )
+    _tn = _tn + """
+
+export interface TextBlockLayout {
+	scaledFontSize: number;
+	lineHeight: number;
+	lineCount: number;
+	blockWidth: number;
+	blockHeight: number;
+	/** 缩放之前的文字块左上角（画布绝对坐标） */
+	left: number;
+	top: number;
+	/** transform.scale 之后文字块的中心与半尺寸（画布绝对坐标） */
+	centerX: number;
+	centerY: number;
+	halfWidth: number;
+	halfHeight: number;
+	anchorX: number;
+	anchorY: number;
+	textBaseline: CanvasTextBaseline;
+}
+
+/**
+ * 逐行复刻 TextNode.render 的排版计算：自动换行宽度、行数 × 行高、
+ * 垂直夹紧（文字被夹进画布）、textAlign 锚点、transform.scale。
+ * 选中框 / 点选 / 吸附都走这里，保证「框跟字走」。
+ */
+export function layoutTextBlock({
+	element,
+	canvasWidth,
+	canvasHeight,
+	transform,
+}: {
+	element: TextElement;
+	canvasWidth: number;
+	canvasHeight: number;
+	transform?: TextElement["transform"];
+}): TextBlockLayout | null {
+	if (typeof document === "undefined") return null;
+	const context = document.createElement("canvas").getContext("2d");
+	if (!context) return null;
+
+	const tf = transform ?? element.transform;
+	const canvasCenter = { x: canvasWidth / 2, y: canvasHeight / 2 };
+	const scaledFontSize = scaleFontSize({
+		fontSize: element.fontSize,
+		canvasHeight,
+	});
+	context.font = getTextFont({ element, scaledFontSize });
+
+	const lineHeight = scaledFontSize * 1.3;
+	const textBaseline: CanvasTextBaseline = isBottomAlignedSubtitleText({
+		element,
+	})
+		? "bottom"
+		: "middle";
+
+	// 与 TextNode 完全一致：有 boxWidth 用它，超宽时长字幕自动换行到 90% 画布宽
+	const maxLineWidth = canvasWidth * 0.9;
+	const boxWidth = element.boxWidth;
+	const hasBoxWidth = boxWidth !== undefined && boxWidth > 0;
+	let scaledBoxWidth = hasBoxWidth
+		? scaleBoxWidth({ boxWidth, canvasHeight })
+		: 0;
+	const singleLineWidth = context.measureText(element.content).width;
+	if (!hasBoxWidth && singleLineWidth > maxLineWidth) {
+		scaledBoxWidth = maxLineWidth;
+	}
+
+	const lines: string[] =
+		scaledBoxWidth > 0
+			? wrapText({ context, text: element.content, maxWidth: scaledBoxWidth })
+			: [element.content];
+	let widest = 0;
+	for (const line of lines) {
+		widest = Math.max(widest, context.measureText(line).width);
+	}
+	const blockWidth =
+		scaledBoxWidth > 0
+			? Math.min(scaledBoxWidth, widest > 0 ? widest : scaledBoxWidth)
+			: singleLineWidth;
+	const blockHeight = Math.max(lineHeight, lines.length * lineHeight);
+
+	// 垂直夹紧：TextNode 会把文本块夹进画布，框必须跟着一起夹
+	const padY = element.backgroundPaddingY ?? 4;
+	const halfBlockHeight = blockHeight / 2 + padY;
+	const anchorX = tf.position.x + canvasCenter.x;
+	const requestedY = tf.position.y + canvasCenter.y;
+	const anchorY =
+		canvasHeight > halfBlockHeight * 2
+			? Math.min(
+					Math.max(requestedY, halfBlockHeight),
+					canvasHeight - halfBlockHeight,
+				)
+			: canvasHeight / 2;
+
+	// textAlign 决定 x 是「左边」「右边」还是「中心」，画布里的 x 不是永远居中
+	const align = String(element.textAlign ?? "center");
+	let rawLeft: number;
+	if (align === "left" || align === "start") {
+		rawLeft = 0;
+	} else if (align === "right" || align === "end") {
+		rawLeft = -blockWidth;
+	} else {
+		rawLeft = -blockWidth / 2;
+	}
+	const rawTop = textBaseline === "bottom" ? -blockHeight : -blockHeight / 2;
+
+	const scale = tf.scale || 1;
+	return {
+		scaledFontSize,
+		lineHeight,
+		lineCount: lines.length,
+		blockWidth,
+		blockHeight,
+		left: anchorX + rawLeft * scale,
+		top: anchorY + rawTop * scale,
+		centerX: anchorX + (rawLeft + blockWidth / 2) * scale,
+		centerY: anchorY + (rawTop + blockHeight / 2) * scale,
+		halfWidth: (blockWidth * scale) / 2,
+		halfHeight: (blockHeight * scale) / 2,
+		anchorX,
+		anchorY,
+		textBaseline,
+	};
+}
+"""
+    TEXT_NODE_FILE.write_text(_tn, encoding="utf-8")
+    print(f"  patched {TEXT_NODE_FILE.relative_to(ROOT)} (文本块整体排版)")
+
+ELEMENT_BOUNDS = SRC / "lib" / "preview" / "element-bounds.ts"
+_eb = ELEMENT_BOUNDS.read_text(encoding="utf-8")
+if "layoutTextBlock" not in _eb:
+    _eb = _eb.replace(
+        'import { getTextFont, wrapText } from "@/services/renderer/nodes/text-node";',
+        'import {\n\tgetTextFont,\n\tlayoutTextBlock,\n\twrapText,\n} from "@/services/renderer/nodes/text-node";',
+        1,
+    )
+    _old_start = _eb.index('\tif (element.type === "text") {')
+    _old_end = _eb.index('\tif (element.type === "sticker") {')
+    _new_branch = """\tif (element.type === "text") {
+		// 尺寸直接取绘制用的排版结果（换行后宽度、行数 × 行高、transform.scale）
+		const layout = layoutTextBlock({
+			element,
+			canvasWidth,
+			canvasHeight,
+			transform,
+		});
+		if (!layout) return null;
+		return {
+			halfWidth: layout.halfWidth,
+			halfHeight: layout.halfHeight,
+		};
+	}
+
+"""
+    _eb = _eb[:_old_start] + _new_branch + _eb[_old_end:]
+
+    _center_old = """	const centerY = isBottomAlignedText
+		? canvasHeight / 2 + transform.position.y - halfSize.halfHeight
+		: canvasHeight / 2 + transform.position.y;
+
+	return {
+		x: canvasWidth / 2 + transform.position.x,
+		y: centerY,
+	};"""
+    _center_new = """	if (element.type === "text") {
+		// 文字的中心不是 position：垂直夹紧、textAlign 锚点、transform.scale 都会挪它
+		const layout = layoutTextBlock({
+			element,
+			canvasWidth,
+			canvasHeight,
+			transform,
+		});
+		if (layout) {
+			return { x: layout.centerX, y: layout.centerY };
+		}
+	}
+
+	const centerY = isBottomAlignedText
+		? canvasHeight / 2 + transform.position.y - halfSize.halfHeight
+		: canvasHeight / 2 + transform.position.y;
+
+	return {
+		x: canvasWidth / 2 + transform.position.x,
+		y: centerY,
+	};"""
+    _eb = _eb.replace(_center_old, _center_new, 1)
+    ELEMENT_BOUNDS.write_text(_eb, encoding="utf-8")
+    print(f"  patched {ELEMENT_BOUNDS.relative_to(ROOT)} (选中框按真实排版)")
+
+USED_MEDIA = SRC / "lib" / "timeline" / "used-media.ts"
+USED_MEDIA.write_text(
+    tabsify(
+        """
+import { useMemo } from "react";
+import { useEditor } from "@/hooks/use-editor";
+
+export type UsedMediaKeys = {
+	/** 时间线里出现过的 mediaId（本地素材 / 上传音频） */
+	ids: Set<string>;
+	/** 时间线里出现过的远端 sourceUrl（音效库、素材库） */
+	urls: Set<string>;
+};
+
+export function collectUsedMediaKeys({
+	tracks,
+}: {
+	tracks: { elements: unknown[] }[];
+}): UsedMediaKeys {
+	const ids = new Set<string>();
+	const urls = new Set<string>();
+	for (const track of tracks) {
+		for (const raw of track.elements) {
+			const element = raw as { mediaId?: string; sourceUrl?: string };
+			if (element.mediaId) ids.add(element.mediaId);
+			if (element.sourceUrl) urls.add(element.sourceUrl);
+		}
+	}
+	return { ids, urls };
+}
+
+/** 面板里判断「这个素材是否已经在时间线上」（订阅时间线变化，增删即时更新） */
+export function useUsedMediaKeys(): UsedMediaKeys {
+	const editor = useEditor();
+	return useMemo(
+		() => collectUsedMediaKeys({ tracks: editor.timeline.getTracks() }),
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+		[editor, editor.timeline.getTracks()],
+	);
+}
+"""
+    )
+    + "\n",
+    encoding="utf-8",
+)
+print(f"  wrote {USED_MEDIA.relative_to(ROOT)} (已添加判定)")
+
+DRAGGABLE_ITEM = SRC / "components" / "editor" / "panels" / "assets" / "draggable-item.tsx"
+_di = DRAGGABLE_ITEM.read_text(encoding="utf-8")
+if "useUsedMediaKeys" not in _di:
+    _di = _di.replace(
+        'import { useEditor } from "@/hooks/use-editor";',
+        'import { useEditor } from "@/hooks/use-editor";\n'
+        'import { useUsedMediaKeys } from "@/lib/timeline/used-media";',
+        1,
+    )
+    _di = _di.replace(
+        "\tconst editor = useEditor();\n",
+        "\tconst editor = useEditor();\n"
+        "\t// 时间线里已经有这个素材就打个「已添加」角标（仍然可以再拖一份进去）\n"
+        "\tconst usedMedia = useUsedMediaKeys();\n"
+        "\tconst alreadyAdded = Boolean(\n"
+        "\t\tdragData?.id && usedMedia.ids.has(String(dragData.id)),\n"
+        "\t);\n",
+        1,
+    )
+    _di = _di.replace(
+        "\t\t\t\t\t\t{preview}\n",
+        "\t\t\t\t\t\t{preview}\n"
+        "\t\t\t\t\t\t{alreadyAdded ? (\n"
+        '\t\t\t\t\t\t\t<span className="bg-primary/85 text-primary-foreground absolute left-1 top-1 z-10 rounded-sm px-1.5 py-0.5 text-[10px] font-medium leading-none">\n'
+        "\t\t\t\t\t\t\t\t已添加\n"
+        "\t\t\t\t\t\t\t</span>\n"
+        "\t\t\t\t\t\t) : null}\n",
+        1,
+    )
+    DRAGGABLE_ITEM.write_text(_di, encoding="utf-8")
+    print(f"  patched {DRAGGABLE_ITEM.relative_to(ROOT)} (已添加角标)")
+
 # ------------------------- 视频片段：分离音频（muted）后不再画波形
+# 说明：音效/音频面板也是用 DraggableItem 渲染的（GridView → DraggableItem），
+# 「已添加」角标在 DraggableItem 里统一处理，这里不用再改 sounds.tsx。
+
 TIMELINE_ELEMENT = SRC / "components" / "editor" / "panels" / "timeline" / "timeline-element.tsx"
 _te = TIMELINE_ELEMENT.read_text(encoding="utf-8")
 
@@ -8778,776 +9115,6 @@ function collectMediaAudioClip({""",
     print(f"  patched {AUDIO_LIB.relative_to(ROOT)} (视频用人声美化后的音轨)")
 
 
-# ------------------------------ 预览：原生 <video> 播放 + DOM 字幕/贴纸悬浮层
-# 原来的预览是「每帧把 1080p 画面 drawImage 进 canvas」的实时合成：
-# 视频解码一帧 → 拷进 canvas → 再交给合成器，GPU/CPU 都在跑满。
-# 现在：视频/图片用原生 <video>/<img> 按变换摆好，浏览器自己播；
-# 字幕仍用 TextNode 绘制（像素与原来一致），但只画一张静态位图、内容变了才重画；
-# 贴纸是 <img>。等于「播放器照常播放，字幕浮在上面」。
-PREVIEW_DOM_LAYERS = (
-    SRC / "components" / "editor" / "panels" / "preview" / "preview-dom-layers.tsx"
-)
-PREVIEW_DOM_LAYERS_SOURCE = tabsify(
-    """
-"use client";
-
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useEditor } from "@/hooks/use-editor";
-
-import { getVisualSourceTime } from "@/lib/timeline/element-utils";
-import { isBottomAlignedSubtitleText } from "@/lib/timeline/text-utils";
-import { DEFAULT_BLUR_INTENSITY } from "@/constants/project-constants";
-import type { CanvasRenderer } from "@/services/renderer/canvas-renderer";
-import { TextNode } from "@/services/renderer/nodes/text-node";
-import type { MediaAsset } from "@/types/assets";
-import type { TBackground, TCanvasSize } from "@/types/project";
-import type {
-  ImageElement,
-  StickerElement,
-  TextElement,
-  TimelineElement,
-  TimelineTrack,
-  VideoElement,
-} from "@/types/timeline";
-
-const EPSILON = 1 / 1000;
-
-type VisualElement = VideoElement | ImageElement;
-
-type ActiveElements = {
-  visuals: VisualElement[];
-  stickers: StickerElement[];
-  texts: TextElement[];
-};
-
-function isActive({
-  element,
-  time,
-}: {
-  element: TimelineElement;
-  time: number;
-}): boolean {
-  return (
-    time >= element.startTime - EPSILON &&
-    time < element.startTime + element.duration - EPSILON
-  );
-}
-
-function collectActive({
-  tracks,
-  time,
-}: {
-  tracks: TimelineTrack[];
-  time: number;
-}): ActiveElements {
-  const visuals: VisualElement[] = [];
-  const stickers: StickerElement[] = [];
-  const texts: TextElement[] = [];
-
-  for (const track of tracks) {
-    if ("hidden" in track && track.hidden) continue;
-    for (const element of track.elements) {
-      if ("hidden" in element && element.hidden) continue;
-      if (!isActive({ element, time })) continue;
-      if (element.type === "video" || element.type === "image") {
-        visuals.push(element);
-      }
-      if (element.type === "sticker") stickers.push(element);
-      if (element.type === "text") texts.push(element);
-    }
-  }
-
-  return { visuals, stickers, texts };
-}
-
-/** 和 VisualNode.renderVisual 同一套算法：contain 缩放后再乘 transform.scale。 */
-function visualBox({
-  element,
-  sourceWidth,
-  sourceHeight,
-  canvasSize,
-  fitCanvasSize,
-}: {
-  element: VisualElement | StickerElement;
-  sourceWidth: number;
-  sourceHeight: number;
-  canvasSize: TCanvasSize;
-  fitCanvasSize: TCanvasSize;
-}) {
-  const containScale = Math.min(
-    fitCanvasSize.width / sourceWidth,
-    fitCanvasSize.height / sourceHeight,
-  );
-  const width = sourceWidth * containScale * element.transform.scale;
-  const height = sourceHeight * containScale * element.transform.scale;
-  return {
-    left: canvasSize.width / 2 + element.transform.position.x - width / 2,
-    top: canvasSize.height / 2 + element.transform.position.y - height / 2,
-    width,
-    height,
-  };
-}
-
-/** 画布单位 → 屏幕像素：直接按显示尺寸排版，避免多一张 1080p 缩放层。 */
-/** 把源时间夹进 [0, 素材末尾-0.05]：seek 过片尾在 Chromium 里会画成纯黑，
- *  rAF 的 tick 和 syncVideos 必须共用同一套夹取，否则两边会互相打架。 */
-function clampToMedia(video: HTMLVideoElement, target: number): number {
-  const mediaDuration = Number.isFinite(video.duration) ? video.duration : 0;
-  if (mediaDuration <= 0) return Math.max(target, 0);
-  return Math.min(Math.max(target, 0), Math.max(mediaDuration - 0.05, 0));
-}
-
-function layerStyle({
-  element,
-  box,
-  scale,
-}: {
-  element: VisualElement | StickerElement;
-  box: { left: number; top: number; width: number; height: number };
-  scale: number;
-}) {
-  const flipX = element.transform.flipX ? -1 : 1;
-  const flipY = element.transform.flipY ? -1 : 1;
-  const rotate = element.transform.rotate ?? 0;
-  return {
-    position: "absolute" as const,
-    left: box.left * scale,
-    top: box.top * scale,
-    width: box.width * scale,
-    height: box.height * scale,
-    opacity: element.opacity,
-    transform: `rotate(${rotate}deg) scale(${flipX}, ${flipY})`,
-    transformOrigin: "center",
-    pointerEvents: "none" as const,
-  };
-}
-
-function VideoLayer({
-  element,
-  media,
-  canvasSize,
-  fitCanvasSize,
-  scale,
-  registerVideo,
-}: {
-  element: VideoElement;
-  media: MediaAsset;
-  canvasSize: TCanvasSize;
-  fitCanvasSize: TCanvasSize;
-  scale: number;
-  registerVideo: (args: {
-    id: string;
-    element: VideoElement;
-    video: HTMLVideoElement | null;
-  }) => void;
-}) {
-  const editor = useEditor();
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const rate = element.playbackRate ?? 1;
-  const reversed = element.reversed ?? false;
-  const box = visualBox({
-    element,
-    sourceWidth: media.width ?? canvasSize.width,
-    sourceHeight: media.height ?? canvasSize.height,
-    canvasSize,
-    fitCanvasSize,
-  });
-
-  // 登记这个视频：播放时钟以它为准，字幕就不会跟着卡住
-  useEffect(() => {
-    const video = videoRef.current;
-    registerVideo({ id: element.id, element, video });
-    if (!video) return;
-    const notify = () => {
-      window.dispatchEvent(new CustomEvent("playback-update"));
-    };
-    const events = [
-      "timeupdate",
-      "seeking",
-      "seeked",
-      "play",
-      "pause",
-      "ratechange",
-    ];
-    for (const name of events) video.addEventListener(name, notify);
-
-    // 挂载时先把画面定位到「当前播放头」对应的源时间，再让它播。
-    // 不这么做的话：片段一出现（转场/断点）就从 0 秒开始播，随后 tick 发现跑偏
-    // 再 seek 到正确位置 —— 那一次 seek 会让浏览器重新解码，观众看到的就是闪一下。
-    const prime = () => {
-      const target = getVisualSourceTime({
-        timelineTime: editor.playback.getCurrentTime(),
-        startTime: element.startTime,
-        duration: element.duration,
-        trimStart: element.trimStart,
-        playbackRate: element.playbackRate ?? 1,
-        reversed: element.reversed ?? false,
-      });
-      const next = clampToMedia(video, target);
-      if (!Number.isFinite(next)) return;
-      // 已经在播且有画面时不要插一脚：那种情况交给 tick（带节流），
-      // 这里只负责「刚挂载 / 还没出画」时的首次定位。
-      if (!video.paused && video.readyState >= 2) return;
-      if (Math.abs(video.currentTime - next) > 0.02) {
-        video.currentTime = next;
-      }
-    };
-    prime();
-    video.addEventListener("loadedmetadata", prime, { once: true });
-    return () => {
-      for (const name of events) video.removeEventListener(name, notify);
-      video.removeEventListener("loadedmetadata", prime);
-      registerVideo({ id: element.id, element, video: null });
-    };
-  }, [element.id, element.startTime, element.duration, element.trimStart, editor, registerVideo]);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    let frame = 0;
-    let lastAppTime = -1;
-
-    // 浏览器自己解码播放，这里只做「对表」：跑偏了才校正，不逐帧搬图。
-    const tick = () => {
-      const playing = editor.playback.getIsPlaying();
-      const appTime = editor.playback.getCurrentTime();
-      // app 时钟是 rAF 推的，被浏览器限流时会原地不动；
-      // 那种情况下不要把视频拽回去，让它自己播。
-      const appAdvancing = Math.abs(appTime - lastAppTime) > 1e-4;
-      lastAppTime = appTime;
-
-      const target = getVisualSourceTime({
-        timelineTime: appTime,
-        startTime: element.startTime,
-        duration: element.duration,
-        trimStart: element.trimStart,
-        playbackRate: rate,
-        reversed,
-      });
-      const clamped = clampToMedia(video, target);
-      if (Math.abs(video.playbackRate - rate) > 0.001) {
-        video.playbackRate = rate;
-      }
-
-      // 播放中只在「确实跑偏」时校正，且每 400 ms 最多一次：
-      // 连续 seek 会让浏览器重新解码，画面就是一闪一闪的。
-      const now = Date.now();
-      const lastSeek = video.dataset.ysSeekAt ? Number(video.dataset.ysSeekAt) : 0;
-      const canSeek = now - lastSeek > 400;
-      const seekTo = (value: number) => {
-        video.dataset.ysSeekAt = String(now);
-        video.currentTime = value;
-      };
-
-      if (playing && !reversed) {
-        if (video.paused) void video.play().catch(() => {});
-        if (appAdvancing && canSeek && Math.abs(video.currentTime - clamped) > 0.45) {
-          seekTo(clamped);
-        }
-      } else {
-        if (!video.paused) video.pause();
-        if (Math.abs(video.currentTime - clamped) > 0.02) {
-          video.currentTime = clamped;
-        }
-      }
-
-      frame = requestAnimationFrame(tick);
-    };
-
-    tick();
-    return () => cancelAnimationFrame(frame);
-  }, [
-    editor,
-    element.startTime,
-    element.duration,
-    element.trimStart,
-    rate,
-    reversed,
-  ]);
-
-  return (
-    // 静音：声音走 AudioManager（Sonic 变速不变调那条链路），这里只出画面
-    <video
-      ref={videoRef}
-      src={media.url}
-      muted
-      playsInline
-      preload="auto"
-      disablePictureInPicture
-      style={{ ...layerStyle({ element, box, scale }), objectFit: "fill" }}
-    />
-  );
-}
-
-function ImageLayer({
-  element,
-  media,
-  canvasSize,
-  fitCanvasSize,
-  scale,
-}: {
-  element: ImageElement;
-  media: MediaAsset;
-  canvasSize: TCanvasSize;
-  fitCanvasSize: TCanvasSize;
-  scale: number;
-}) {
-  const box = visualBox({
-    element,
-    sourceWidth: media.width ?? canvasSize.width,
-    sourceHeight: media.height ?? canvasSize.height,
-    canvasSize,
-    fitCanvasSize,
-  });
-
-  // biome-ignore lint/performance/noImgElement: 预览层直接用 blob URL
-  return (
-    <img
-      src={media.url}
-      alt={media.name}
-      draggable={false}
-      style={{ ...layerStyle({ element, box, scale }), objectFit: "fill" }}
-    />
-  );
-}
-
-function StickerLayer({
-  element,
-  canvasSize,
-  scale,
-}: {
-  element: StickerElement;
-  canvasSize: TCanvasSize;
-  scale: number;
-}) {
-  const box = visualBox({
-    element,
-    sourceWidth: 200,
-    sourceHeight: 200,
-    canvasSize,
-    fitCanvasSize: canvasSize,
-  });
-  const color = element.color
-    ? `&color=${encodeURIComponent(element.color)}`
-    : "";
-  const src = `https://api.iconify.design/${element.iconName}.svg?width=200&height=200${color}`;
-
-  // biome-ignore lint/performance/noImgElement: 贴纸就是图标 SVG
-  return (
-    <img
-      src={src}
-      alt={element.iconName}
-      draggable={false}
-      style={{ ...layerStyle({ element, box, scale }), objectFit: "fill" }}
-    />
-  );
-}
-
-function BlurBackdropLayer({
-  media,
-  canvasSize,
-  blurIntensity,
-  scale,
-}: {
-  media: MediaAsset;
-  canvasSize: TCanvasSize;
-  blurIntensity: number;
-  scale: number;
-}) {
-  const src = media.type === "image" ? media.url : media.thumbnailUrl;
-  if (!src) return null;
-
-  // biome-ignore lint/performance/noImgElement: 背景层直接用 blob URL
-  return (
-    <img
-      src={src}
-      alt=""
-      aria-hidden
-      draggable={false}
-      style={{
-        position: "absolute",
-        left: 0,
-        top: 0,
-        width: canvasSize.width * scale,
-        height: canvasSize.height * scale,
-        objectFit: "cover",
-        filter: `blur(${blurIntensity * scale}px)`,
-        transform: "scale(1.4)",
-        transformOrigin: "center",
-        pointerEvents: "none",
-      }}
-    />
-  );
-}
-
-function TextLayer({
-  texts,
-  canvasSize,
-  scale,
-}: {
-  texts: TextElement[];
-  canvasSize: TCanvasSize;
-  scale: number;
-}) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const signature = useMemo(
-    () =>
-      JSON.stringify(
-        texts.map((element) => [
-          element.id,
-          element.content,
-          element.fontSize,
-          element.fontFamily,
-          element.fontWeight,
-          element.fontStyle,
-          element.color,
-          element.backgroundColor,
-          element.backgroundOpacity,
-          element.backgroundPaddingX,
-          element.backgroundPaddingY,
-          element.backgroundBorderRadius,
-          element.boxWidth,
-          element.textAlign,
-          element.stroke,
-          element.shadow,
-          element.opacity,
-          element.transform,
-        ]),
-      ),
-    [texts],
-  );
-
-  useEffect(() => {
-    const target = canvasRef.current;
-    if (!target) return;
-    const context = target.getContext("2d");
-    if (!context) return;
-    context.clearRect(0, 0, target.width, target.height);
-    if (texts.length === 0) return;
-
-    // 还是用原来那套 TextNode 画（像素和 canvas 预览一致），
-    // 但直接画进这一张静态画布：不建中转 canvas、不搬 1080p 位图，
-    // 只在字幕内容/样式变化时重画一次。
-    const renderer = {
-      context,
-      width: canvasSize.width,
-      height: canvasSize.height,
-      fps: 30,
-    } as unknown as CanvasRenderer;
-
-    for (const element of texts) {
-      const node = new TextNode({
-        ...element,
-        canvasCenter: {
-          x: canvasSize.width / 2,
-          y: canvasSize.height / 2,
-        },
-        canvasHeight: canvasSize.height,
-        canvasWidth: canvasSize.width,
-        textBaseline: isBottomAlignedSubtitleText({ element })
-          ? "bottom"
-          : "middle",
-      });
-      void node.render({ renderer, time: element.startTime });
-    }
-
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signature, canvasSize.width, canvasSize.height]);
-
-  // 没有字幕就别挂这张画布，少一个合成层
-  if (texts.length === 0) return null;
-
-  return (
-    <canvas
-      ref={canvasRef}
-      width={canvasSize.width}
-      height={canvasSize.height}
-      style={{
-        position: "absolute",
-        left: 0,
-        top: 0,
-        width: canvasSize.width * scale,
-        height: canvasSize.height * scale,
-        pointerEvents: "none",
-      }}
-    />
-  );
-}
-
-export function PreviewDomLayers({
-  canvasSize,
-  displaySize,
-}: {
-  canvasSize: TCanvasSize;
-  displaySize: { width: number; height: number };
-}) {
-  const editor = useEditor();
-  const tracks = editor.timeline.getTracks();
-  const mediaAssets = editor.media.getAssets();
-  const activeProject = editor.project.getActive();
-  const background: TBackground = activeProject.settings.background;
-  // 适配基准 = 画布本身。原来源码用的是 settings.originalCanvasSize
-  // （第一次插入素材时记下的尺寸），画布改过比例后它不会跟着变，
-  // 预览里素材就只剩画布一小块，而导出按画布合成 → 看起来像「导出被放大」。
-  const fitCanvasSize = canvasSize;
-
-  const mediaMap = useMemo(
-    () => new Map(mediaAssets.map((asset) => [asset.id, asset])),
-    [mediaAssets],
-  );
-
-  const scale =
-    canvasSize.width > 0 ? displaySize.width / canvasSize.width : 1;
-  const [time, setTime] = useState(() => editor.playback.getCurrentTime());
-  const signatureRef = useRef("");
-  // 正在播的视频元素：播放时钟以它为准（app 的时钟是 rAF 推的，
-  // 浏览器一限流 rAF 就会停住，而 <video> 自己还在播 → 字幕会卡住不动）
-  const playingVideos = useRef(
-    new Map<string, { element: VideoElement; video: HTMLVideoElement }>(),
-  );
-
-  const registerVideo = useCallback(
-    ({
-      id,
-      element,
-      video,
-    }: {
-      id: string;
-      element: VideoElement;
-      video: HTMLVideoElement | null;
-    }) => {
-      if (!video) {
-        playingVideos.current.delete(id);
-        return;
-      }
-      playingVideos.current.set(id, { element, video });
-    },
-    [],
-  );
-
-  /** 视频自己的播放位置换算回时间线时间（变速片段要除速率）。 */
-  const timelineTimeFromVideos = (): number | null => {
-    for (const { element, video } of playingVideos.current.values()) {
-      if (video.paused || !Number.isFinite(video.currentTime)) continue;
-      if (element.reversed) continue;
-      const rate = element.playbackRate ?? 1;
-      const mapped =
-        element.startTime + (video.currentTime - element.trimStart) / rate;
-      if (
-        mapped >= element.startTime - 0.05 &&
-        mapped <= element.startTime + element.duration + 0.05
-      ) {
-        return mapped;
-      }
-    }
-    return null;
-  };
-  /** 让 <video> 的播放/暂停、暂停时的画面位置跟 app 状态一致。
-   *  放在定时器/事件里跑，而不是只在 rAF 里跑：rAF 被限流时按播放也能起来。 */
-  const syncVideos = () => {
-    const playing = editor.playback.getIsPlaying();
-    const appTime = editor.playback.getCurrentTime();
-    for (const { element, video } of playingVideos.current.values()) {
-      const shouldPlay = playing && !element.reversed;
-      const target = getVisualSourceTime({
-        timelineTime: appTime,
-        startTime: element.startTime,
-        duration: element.duration,
-        trimStart: element.trimStart,
-        playbackRate: element.playbackRate ?? 1,
-        reversed: element.reversed ?? false,
-      });
-      const clamped = clampToMedia(video, target);
-      if (shouldPlay) {
-        // 播到片尾（ended）必须能重新起来：先回到目标位置再播，
-        // 否则「播完停下」之后按播放永远黑屏。
-        // 播放中的对表交给 rAF 的 tick（带 400ms 节流），这里再抢一次就会闪。
-        if (video.ended) video.currentTime = clamped;
-        if (video.paused) void video.play().catch(() => {});
-        continue;
-      }
-      if (!video.paused) video.pause();
-      if (
-        Number.isFinite(clamped) &&
-        Math.abs(video.currentTime - clamped) > 0.02
-      ) {
-        video.currentTime = clamped;
-      }
-    }
-  };
-  // ComfyUI 弹层关闭时发来 "pause"：把播放状态和所有 <video> 一起停掉。
-  // iframe 是常驻的（关闭只是隐藏），不这么做关掉弹层后声音还在放。
-  useEffect(() => {
-    const onMessage = (event: MessageEvent) => {
-      if (event.data?.type !== "yuancut:command") return;
-      if (event.data.command !== "pause") return;
-      editor.playback.pause();
-      for (const { video } of playingVideos.current.values()) {
-        try {
-          video.pause();
-        } catch {
-          /* ignore */
-        }
-      }
-    };
-    window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
-  }, [editor]);
-
-  // 播放时的时钟选择：
-  // · app 时钟在推进（正常播放）→ 以它为准。它和音频同源，不会像「由视频反推」
-  //   那样在两段重叠（转场）、变速片段或多次映射之间来回跳；
-  //   每跳一次就会触发一次 seek，画面就闪一下——这就是 1.3 倍速 + 转场闪烁的来源。
-  // · app 时钟停住（rAF 被限流）→ 才退回视频时钟，保证字幕不卡死。
-  const lastAppTimeRef = useRef(-1);
-  const lastAppAdvanceRef = useRef(0);
-
-  const currentDisplayTime = (): number => {
-    const appTime = editor.playback.getCurrentTime();
-    if (!editor.playback.getIsPlaying()) {
-      lastAppTimeRef.current = appTime;
-      return appTime;
-    }
-    if (Math.abs(appTime - lastAppTimeRef.current) > 1e-4) {
-      lastAppTimeRef.current = appTime;
-      lastAppAdvanceRef.current = Date.now();
-      return appTime;
-    }
-    if (Date.now() - lastAppAdvanceRef.current > 250) {
-      const fromVideo = timelineTimeFromVideos();
-      if (fromVideo !== null) return fromVideo;
-    }
-    return appTime;
-  };
-
-  // 只有「可见元素集合变化」或「暂停时时间变化（拖播放头）」才重渲染。
-  // 用 150ms 定时器 + 各种事件驱动，而不是 rAF：rAF 被浏览器限流时
-  // 视频还在播，字幕不能跟着卡死。
-  useEffect(() => {
-    const sync = () => {
-      syncVideos();
-      const now = currentDisplayTime();
-      const playing = editor.playback.getIsPlaying();
-      const active = collectActive({ tracks, time: now });
-      const ids = [
-        ...active.visuals.map((element) => element.id),
-        ...active.stickers.map((element) => element.id),
-        ...active.texts.map((element) => element.id),
-      ].join(",");
-      const signature = playing ? `p|${ids}` : `s|${ids}|${Math.round(now * 30)}`;
-      if (signature !== signatureRef.current) {
-        signatureRef.current = signature;
-        setTime(now);
-      }
-    };
-
-    sync();
-    const timer = window.setInterval(sync, 150);
-    window.addEventListener("playback-update", sync);
-    window.addEventListener("playback-seek", sync);
-    document.addEventListener("pointerdown", sync);
-    document.addEventListener("pointerup", sync);
-    document.addEventListener("pointermove", sync);
-    document.addEventListener("keydown", sync);
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("playback-update", sync);
-      window.removeEventListener("playback-seek", sync);
-      document.removeEventListener("pointerdown", sync);
-      document.removeEventListener("pointerup", sync);
-      document.removeEventListener("pointermove", sync);
-      document.removeEventListener("keydown", sync);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editor, tracks]);
-
-  const active = collectActive({ tracks, time });
-  const blurIntensity =
-    background.type === "blur"
-      ? background.blurIntensity
-      : DEFAULT_BLUR_INTENSITY;
-
-  return (
-    <div
-      className="absolute inset-0 overflow-hidden"
-      style={{
-        background: background.type === "color" ? background.color : "black",
-      }}
-    >
-      <div
-        style={{
-          position: "absolute",
-          left: 0,
-          top: 0,
-          width: displaySize.width,
-          height: displaySize.height,
-        }}
-      >
-        {background.type === "blur"
-          ? active.visuals.map((element) => {
-              const media = mediaMap.get(element.mediaId);
-              if (!media) return null;
-              return (
-                <BlurBackdropLayer
-                  key={`blur-${element.id}`}
-                  media={media}
-                  canvasSize={canvasSize}
-                  blurIntensity={blurIntensity}
-                  scale={scale}
-                />
-              );
-            })
-          : null}
-
-        {active.visuals.map((element) => {
-          const media = mediaMap.get(element.mediaId);
-          if (!media) return null;
-          if (element.type === "video") {
-            return (
-              <VideoLayer
-                key={element.id}
-                element={element}
-                media={media}
-                canvasSize={canvasSize}
-                fitCanvasSize={fitCanvasSize}
-                scale={scale}
-                registerVideo={registerVideo}
-              />
-            );
-          }
-          return (
-            <ImageLayer
-              key={element.id}
-              element={element}
-              media={media}
-              canvasSize={canvasSize}
-              fitCanvasSize={fitCanvasSize}
-              scale={scale}
-            />
-          );
-        })}
-
-        {active.stickers.map((element) => (
-          <StickerLayer
-            key={element.id}
-            element={element}
-            canvasSize={canvasSize}
-            scale={scale}
-          />
-        ))}
-
-        <TextLayer texts={active.texts} canvasSize={canvasSize} scale={scale} />
-      </div>
-    </div>
-  );
-}
-"""
-)
-
-PREVIEW_DOM_LAYERS.write_text(PREVIEW_DOM_LAYERS_SOURCE + "\n", encoding="utf-8")
-print(f"  wrote {PREVIEW_DOM_LAYERS.relative_to(ROOT)} (DOM 预览层)")
-
-
 # --------------------------- 选中框 / 拖动命中：同样以画布为适配基准
 # 只改预览层会让「看到的画面」和「选中框 / 拖动」错位，这三处必须同源。
 _FIT_PATCHES = [
@@ -9610,122 +9177,6 @@ for _fit_path, _fit_old, _fit_new in _FIT_PATCHES:
         raise SystemExit(f"适配基准补丁锚点没找到：{_fit_path}")
     _fit_path.write_text(_fit_text.replace(_fit_old, _fit_new, 1), encoding="utf-8")
     print(f"  patched {_fit_path.relative_to(ROOT)} (预览适配基准 = 画布)")
-
-
-# 预览面板：把每帧 canvas 合成换成 DOM 层
-PREVIEW_PANEL_FILE = (
-    SRC / "components" / "editor" / "panels" / "preview" / "index.tsx"
-)
-_pp = PREVIEW_PANEL_FILE.read_text(encoding="utf-8")
-if "PreviewDomLayers" not in _pp:
-    _pp = _pp.replace(
-        'import { useCallback, useEffect, useMemo, useRef } from "react";',
-        'import { useEffect, useMemo, useRef } from "react";',
-        1,
-    )
-    _pp = _pp.replace(
-        'import { useRafLoop } from "@/hooks/use-raf-loop";' + chr(10),
-        "",
-        1,
-    )
-    _pp = _pp.replace(
-        'import type { RootNode } from "@/services/renderer/nodes/root-node";' + chr(10),
-        "",
-        1,
-    )
-    _pp = _pp.replace(
-        'import { formatTimeCode, getLastFrameTime } from "@/lib/time";',
-        'import { formatTimeCode } from "@/lib/time";' + chr(10)
-        + 'import { PreviewDomLayers } from "./preview-dom-layers";',
-        1,
-    )
-
-    PREVIEW_CANVAS_SOURCE = tabsify(
-        """
-function PreviewCanvas() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const { width: nativeWidth, height: nativeHeight } = usePreviewSize();
-  const containerSize = useContainerSize({ containerRef });
-  const editor = useEditor();
-  const activeProject = editor.project.getActive();
-
-  const displaySize = useMemo(() => {
-    if (
-      !nativeWidth ||
-      !nativeHeight ||
-      containerSize.width === 0 ||
-      containerSize.height === 0
-    ) {
-      return { width: nativeWidth ?? 0, height: nativeHeight ?? 0 };
-    }
-
-    const paddingBuffer = 4;
-    const availableWidth = containerSize.width - paddingBuffer;
-    const availableHeight = containerSize.height - paddingBuffer;
-
-    const aspectRatio = nativeWidth / nativeHeight;
-    const containerAspect = availableWidth / availableHeight;
-
-    const displayWidth =
-      containerAspect > aspectRatio
-        ? availableHeight * aspectRatio
-        : availableWidth;
-    const displayHeight =
-      containerAspect > aspectRatio
-        ? availableHeight
-        : availableWidth / aspectRatio;
-
-    return { width: displayWidth, height: displayHeight };
-  }, [nativeWidth, nativeHeight, containerSize.width, containerSize.height]);
-
-  return (
-    <div
-      ref={containerRef}
-      className="relative flex h-full w-full items-center justify-center"
-    >
-      <div
-        className="relative overflow-hidden border"
-        style={{
-          width: displaySize.width,
-          height: displaySize.height,
-          background:
-            activeProject.settings.background.type === "blur"
-              ? "transparent"
-              : activeProject?.settings.background.color,
-        }}
-      >
-        {/* 原生视频 + DOM 字幕/贴纸：浏览器自己播，不再每帧重合成 */}
-        <PreviewDomLayers
-          canvasSize={{ width: nativeWidth, height: nativeHeight }}
-          displaySize={displaySize}
-        />
-        {/* 只给交互层量尺寸用，不画东西 */}
-        <canvas
-          ref={canvasRef}
-          width={nativeWidth}
-          height={nativeHeight}
-          className="pointer-events-none absolute inset-0 invisible"
-          style={{ width: displaySize.width, height: displaySize.height }}
-        />
-        <PreviewInteractionOverlay
-          canvasRef={canvasRef}
-          displaySize={displaySize}
-        />
-      </div>
-    </div>
-  );
-}
-"""
-    )
-
-    _marker = "function PreviewCanvas() {"
-    _index = _pp.find(_marker)
-    if _index == -1:
-        raise SystemExit(f"PreviewCanvas 不在 {PREVIEW_PANEL_FILE}")
-    _pp = _pp[:_index] + PREVIEW_CANVAS_SOURCE + chr(10)
-    PREVIEW_PANEL_FILE.write_text(_pp, encoding="utf-8")
-    print(f"  patched {PREVIEW_PANEL_FILE.relative_to(ROOT)} (预览改 DOM 层)")
 
 
 # ------------------------------------------- 片段配色 / 相邻缝隙 / 裁剪伸缩
@@ -12131,3 +11582,276 @@ if "resolveSourceSize" not in _eb:
 
 # （画布/帧率同步、导出挂起预览、NVENC 三块补丁暂时移除：实现已合入运行时文件，
 #   以后要重建时再单独补回，避免补丁脚本继续膨胀）
+
+
+# ------------------------------ 预览帧管线：逐帧 seek 语义 + 入点预热
+# 参考 HyperFrames 的 seek 协议：画面必须是「时间的纯函数」，每一帧都要完整合成，
+# 不允许因为某一层还没解出帧就少画一层（观感就是黑闪）。所以：
+#   1) VideoNode 自己记住上一次成功解出的帧，解码没跟上时沿用，layer 永不消失；
+#   2) 播放头前方 2 秒内的素材提前把解码器建好，进入片段时不再现场初始化。
+VIDEO_CACHE_SERVICE = SRC / "services" / "video-cache" / "service.ts"
+VIDEO_CACHE_SERVICE.write_text(VIDEO_CACHE_SERVICE.read_text(encoding="utf-8"), encoding="utf-8")
+
+_vcs = VIDEO_CACHE_SERVICE.read_text(encoding="utf-8")
+if "\tprivate prewarming" not in _vcs:
+    # sinks 的 key 已经是「素材:片段」形式的 cacheKey（另一个补丁改的），
+    # 预热也按 cacheKey 记账，不跟播放游标抢。
+    _vcs = _vcs.replace(
+        "\tprivate sinks = new Map<string, VideoSinkData>();",
+        "\tprivate sinks = new Map<string, VideoSinkData>();\n"
+        "\tprivate prewarming = new Map<string, Promise<void>>();",
+        1,
+    )
+    if "\tprivate prewarming" not in _vcs:
+        raise SystemExit("video-cache 字段锚点没匹配")
+    VIDEO_CACHE_SERVICE.write_text(_vcs, encoding="utf-8")
+
+PREWARM_METHOD = tabsify(
+    """
+/**
+ * 入点预热：把容器解析 + 解码器建好（最贵的一步），不动播放游标。
+ * 播放头进入片段时不用再现场初始化，边界那几帧就不会等。
+ */
+async prewarm({
+  mediaId,
+  file,
+}: {
+  mediaId: string;
+  file: File;
+}): Promise<void> {
+  const key = `${mediaId}:prewarm`;
+  if (this.sinks.has(key)) return;
+
+  const running = this.prewarming.get(key);
+  if (running) return running;
+
+  const task = this.ensureSink({ key, mediaId, file })
+    .catch((error) => {
+      console.warn(`Prewarm failed for ${key}:`, error);
+    })
+    .finally(() => {
+      this.prewarming.delete(key);
+    });
+
+  this.prewarming.set(key, task);
+  return task;
+}
+"""
+)
+
+sub_src(
+    VIDEO_CACHE_SERVICE,
+    r"^([ \t]*)clearVideo\(\{ mediaId \}: \{ mediaId: string \}\)",
+    lambda m: "\t" + PREWARM_METHOD.replace(chr(10), chr(10) + "\t") + "\n\n" + m.group(0),
+    marker="async prewarm(",
+)
+
+PREWARM_FILE = SRC / "services" / "video-cache" / "prewarm.ts"
+PREWARM_FILE.write_text(
+    tabsify(
+        """
+"use client";
+
+import type { MediaAsset } from "@/types/assets";
+import type { TimelineTrack } from "@/types/timeline";
+import { videoCache } from "@/services/video-cache/service";
+
+const LOOKAHEAD_SECONDS = 2.0;
+const MIN_INTERVAL_MS = 250;
+const EPSILON = 1 / 1000;
+
+let lastRun = 0;
+
+/**
+ * 播放头前方 2 秒内的视频素材，提前把解码器建好。
+ * 属于帧管线的一部分：边界不该出现「等解码」，更不该出现缺一层的黑帧。
+ */
+export function prewarmTimeline({
+  tracks,
+  mediaAssets,
+  time,
+}: {
+  tracks: TimelineTrack[];
+  mediaAssets: MediaAsset[];
+  time: number;
+}): void {
+  if (typeof performance === "undefined") return;
+  const now = performance.now();
+  if (now - lastRun < MIN_INTERVAL_MS) return;
+  lastRun = now;
+
+  const files = new Map<string, File>();
+  for (const asset of mediaAssets) {
+    if (asset.file) files.set(asset.id, asset.file);
+  }
+
+  for (const track of tracks) {
+    if (track.type !== "video" || track.hidden) continue;
+    for (const element of track.elements) {
+      if (element.type !== "video") continue;
+      if (element.hidden) continue;
+      const end = element.startTime + element.duration;
+      if (end <= time - EPSILON) continue;
+      if (element.startTime > time + LOOKAHEAD_SECONDS) continue;
+      const file = files.get(element.mediaId);
+      if (!file) continue;
+      void videoCache.prewarm({ mediaId: element.mediaId, file });
+    }
+  }
+}
+"""
+    )
+    + "\n",
+    encoding="utf-8",
+)
+print(f"  wrote {PREWARM_FILE.relative_to(ROOT)} (时间轴预热)")
+
+VIDEO_NODE_FILE = SRC / "services" / "renderer" / "nodes" / "video-node.ts"
+_vnode = VIDEO_NODE_FILE.read_text(encoding="utf-8")
+if "lastFrame" not in _vnode:
+    _vnode = _vnode.replace(
+        'import { videoCache } from "@/services/video-cache/service";',
+        'import { videoCache } from "@/services/video-cache/service";\n'
+        'import type { WrappedCanvas } from "mediabunny";',
+        1,
+    )
+    _vnode = _vnode.replace(
+        "export class VideoNode extends VisualNode<VideoNodeParams> {\n",
+        "export class VideoNode extends VisualNode<VideoNodeParams> {\n"
+        "\t/** 最近一次成功解出的帧：这一层永远不会因为解码失败而消失 */\n"
+        "\tprivate lastFrame: WrappedCanvas | null = null;\n\n",
+        1,
+    )
+    _vnode = _vnode.replace(
+        "\t\tif (frame) {\n"
+        "\t\t\tthis.renderVisual({\n"
+        "\t\t\t\trenderer,\n"
+        "\t\t\t\tsource: frame.canvas,\n"
+        "\t\t\t\tsourceWidth: frame.canvas.width,\n"
+        "\t\t\t\tsourceHeight: frame.canvas.height,\n"
+        "\t\t\t});\n"
+        "\t\t}",
+        "\t\tif (frame) {\n"
+        "\t\t\tthis.lastFrame = frame;\n"
+        "\t\t}\n\n"
+        "\t\t// 解码没跟上时沿用上一帧：宁可晚一帧，也不要缺一层（露黑底）\n"
+        "\t\tconst visual = frame ?? this.lastFrame;\n"
+        "\t\tif (visual) {\n"
+        "\t\t\tthis.renderVisual({\n"
+        "\t\t\t\trenderer,\n"
+        "\t\t\t\tsource: visual.canvas,\n"
+        "\t\t\t\tsourceWidth: visual.canvas.width,\n"
+        "\t\t\t\tsourceHeight: visual.canvas.height,\n"
+        "\t\t\t});\n"
+        "\t\t}",
+        1,
+    )
+    if "visual.canvas" not in _vnode:
+        raise SystemExit("video-node 兜底补丁锚点没匹配")
+    VIDEO_NODE_FILE.write_text(_vnode, encoding="utf-8")
+    print(f"  patched {VIDEO_NODE_FILE.relative_to(ROOT)} (帧兜底)")
+
+PREVIEW_PANEL_FILE = (
+    SRC / "components" / "editor" / "panels" / "preview" / "index.tsx"
+)
+_pv = PREVIEW_PANEL_FILE.read_text(encoding="utf-8")
+if "prewarmTimeline" not in _pv:
+    _pv = _pv.replace(
+        'import { buildScene } from "@/services/renderer/scene-builder";',
+        'import { buildScene } from "@/services/renderer/scene-builder";\n'
+        'import { prewarmTimeline } from "@/services/video-cache/prewarm";',
+        1,
+    )
+    _pv = _pv.replace(
+        "\t\t\tconst time = editor.playback.getCurrentTime();\n"
+        "\t\t\tconst lastFrameTime = getLastFrameTime({",
+        "\t\t\tconst time = editor.playback.getCurrentTime();\n"
+        "\t\t\t// 按时间轴预热，而不是等 DOM 层挂载：入点前 2 秒就把解码器建好\n"
+        "\t\t\tprewarmTimeline({\n"
+        "\t\t\t\ttracks: editor.timeline.getTracks(),\n"
+        "\t\t\t\tmediaAssets: editor.media.getAssets(),\n"
+        "\t\t\t\ttime,\n"
+        "\t\t\t});\n"
+        "\t\t\tconst lastFrameTime = getLastFrameTime({",
+        1,
+    )
+    _pv = _pv.replace(
+        "\t}, [renderer, renderTree, editor.playback]);",
+        "\t}, [renderer, renderTree, editor]);",
+        1,
+    )
+    if "prewarmTimeline({" not in _pv:
+        raise SystemExit("preview 预热调用锚点没匹配")
+    PREVIEW_PANEL_FILE.write_text(_pv, encoding="utf-8")
+    print(f"  patched {PREVIEW_PANEL_FILE.relative_to(ROOT)} (播放头前方预热)")
+
+
+# ------------------------------ 文字：底对齐少算半行（框/字/导出三者错位）
+# renderMultiline 逐行用 middle baseline 画，首行中心就是 startY。
+# 底对齐时 startY=-totalHeight 会让整块比「块底贴基准点」高半行：
+# 预览里字跑到选中框上方、导出（drawtext 按底边对齐）又比预览低半行。
+TEXT_NODE_BOTTOM_NEW = (
+    "\t\t// 首行中心 = startY（逐行 middle baseline）。底对齐要的是「块底 = 基准点」，\n"
+    "\t\t// 所以首行中心必须再下移半行，否则整块高半行：字在框外、导出也比预览低。\n"
+    '\t\tlet startY: number;\n'
+    '\t\tif (textBaseline === "bottom") {\n'
+    "\t\t\tstartY = -totalHeight + lineHeight / 2;\n"
+)
+sub_src(
+    SRC / "services" / "renderer" / "nodes" / "text-node.ts",
+    r"^\t\tlet startY: number;\n\t\tif \(textBaseline === \"bottom\"\) \{\n\t\t\tstartY = -totalHeight;",
+    lambda m: TEXT_NODE_BOTTOM_NEW,
+    marker="startY = -totalHeight + lineHeight / 2;",
+)
+
+# ------------------------------ 字幕默认样式：背景关、黑描边、白字、5 号
+SUBTITLE_CONSTANTS = SRC / "constants" / "subtitle-constants.ts"
+_sc = SUBTITLE_CONSTANTS.read_text(encoding="utf-8")
+if "stroke: { color: \"#000000\", width: 3 }" not in _sc.split("templateId: \"modern\"")[0]:
+    _sc = _sc.replace(
+        '\t\tbackgroundColor: "rgba(0, 0, 0, 0.7)",',
+        '\t\tbackgroundColor: "transparent",\n'
+        '\t\tstroke: { color: "#000000", width: 3 },',
+        1,
+    )
+    SUBTITLE_CONSTANTS.write_text(_sc, encoding="utf-8")
+    print(f"  patched {SUBTITLE_CONSTANTS.relative_to(ROOT)} (默认字幕：透明底 + 黑描边)")
+
+# ------------------------------ 字幕面板：去掉模板预览小样
+CAPTIONS_VIEW = SRC / "components" / "editor" / "panels" / "assets" / "views" / "captions.tsx"
+_cv = CAPTIONS_VIEW.read_text(encoding="utf-8")
+_CARD = tabsify(
+    """
+          <div
+            className="flex items-center justify-center rounded-md border p-4"
+            style={{ backgroundColor: "#1a1a2e", minHeight: 60 }}
+          >
+            <span
+              style={{
+                fontSize: 14,
+                fontFamily: selectedTemplate.fontFamily,
+                color: selectedTemplate.color,
+                backgroundColor: selectedTemplate.backgroundColor,
+                fontWeight: selectedTemplate.fontWeight,
+                fontStyle: selectedTemplate.fontStyle,
+                textDecoration: selectedTemplate.textDecoration,
+                WebkitTextStroke: selectedTemplate.stroke
+                  ? `${Math.max(selectedTemplate.stroke.width * 0.5, 0.5)}px ${selectedTemplate.stroke.color}`
+                  : undefined,
+                padding: "2px 6px",
+                borderRadius: 2,
+              }}
+            >
+              {t("{{name}} Preview", {
+                name: selectedTemplate.templateName,
+              })}
+            </span>
+          </div>
+"""
+)
+if "selectedTemplate.templateName" in _cv and _CARD in _cv:
+    _cv = _cv.replace(_CARD, "", 1)
+    CAPTIONS_VIEW.write_text(_cv, encoding="utf-8")
+    print(f"  patched {CAPTIONS_VIEW.relative_to(ROOT)} (去掉模板预览)")
+elif _CARD not in _cv and "selectedTemplate.templateName" in _cv:
+    raise SystemExit("字幕模板预览块锚点没匹配")

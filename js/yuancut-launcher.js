@@ -50,7 +50,7 @@ const CSS = `
   display: none;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: 0;
   background: rgba(0, 0, 0, 0.72);
   backdrop-filter: blur(4px);
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -60,11 +60,12 @@ const CSS = `
 #${OVERLAY_ID} .yuancut-panel {
   display: flex;
   flex-direction: column;
-  width: min(1680px, 100%);
+  width: 100%;
   height: 100%;
   overflow: hidden;
   border: 1px solid hsl(0 0% 16%);
-  border-radius: 14px;
+  border: 0;
+  border-radius: 0;
   background: hsl(0 0% 7%);
   box-shadow: 0 32px 90px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(0, 157, 255, 0.06);
 }
@@ -199,11 +200,19 @@ const CSS = `
 `;
 
 function injectStyle() {
-  if (document.getElementById(STYLE_ID)) return;
+  if (!document.head || document.getElementById(STYLE_ID)) return;
   const style = document.createElement("style");
   style.id = STYLE_ID;
   style.textContent = CSS;
   document.head.appendChild(style);
+}
+
+// 样式必须在节点第一次渲染前就位：以前只在打开编辑器（ensureOverlay）时才注入，
+// 结果新拖出来的节点先以「无样式」状态出现，按钮被挤到节点外面看不见。
+if (document.head) {
+  injectStyle();
+} else {
+  document.addEventListener("DOMContentLoaded", injectStyle, { once: true });
 }
 
 let loadingEl = null;
@@ -223,6 +232,42 @@ function hideLoading() {
   clearTimeout(loadingTimer);
   loadingTimer = null;
   if (loadingEl) loadingEl.hidden = true;
+}
+
+/**
+ * 把可选扩展的前端脚本注入 iframe。
+ * iframe 是常驻的（关闭只是隐藏），部署扩展之前打开过的页面会一直用旧 HTML，
+ * 服务端注入的 <script> 就不会出现；这里在每次加载/打开时补一次，幂等。
+ */
+function ensureExtScript() {
+  if (!frame) return;
+  let doc = null;
+  try {
+    doc = frame.contentDocument;
+  } catch {
+    return;
+  }
+  if (!doc || !doc.head) return;
+  // 每次都换一个版本号强制重新拉取；旧脚本剔除，旧实例靠令牌自动退场
+  const version = String(Date.now());
+  for (const old of doc.querySelectorAll("script[data-yc-ext], script[src*='/yuancut/ext/ui/']")) {
+    old.remove();
+  }
+  try {
+    doc.defaultView.__ycExtToken = null;
+  } catch {}
+  const script = doc.createElement("script");
+  script.type = "module";
+  script.src = `/yuancut/ext/ui/ui.js?v=${version}`;
+  script.dataset.ycExt = "1";
+  script.onerror = () => script.remove();
+  doc.head.appendChild(script);
+  // 补注入时面板可能已经渲染完，直接触发一次扫描
+  setTimeout(() => {
+    try {
+      frame.contentWindow?.dispatchEvent(new Event("yc-ext-rescan"));
+    } catch {}
+  }, 300);
 }
 
 /** 整页加载某个地址 */
@@ -276,10 +321,9 @@ function reloadFrame() {
 
 function onOverlayClick(event) {
   const action = event.target.closest?.("[data-act]")?.dataset.act;
-  if (!action) {
-    if (event.target === overlay) closeEditor();
-    return;
-  }
+  // 只在明确点了「关闭」时才退出：以前点面板外的空白背景也会关，
+  // 全屏后更容易误触（编辑器占满屏幕，用户以为点到的是自己的位置）。
+  if (!action) return;
   if (action === "close") {
     closeEditor();
   } else if (action === "reload") {
@@ -338,7 +382,10 @@ function ensureOverlay() {
 
   frame = overlay.querySelector(".yuancut-frame");
   loadingEl = overlay.querySelector(".yuancut-loading");
-  frame.addEventListener("load", hideLoading);
+  frame.addEventListener("load", () => {
+    hideLoading();
+    ensureExtScript();
+  });
   window.addEventListener("message", (event) => {
     if (event.data?.type === "yuancut:navigated") {
       clearTimeout(navAckTimer);
@@ -348,6 +395,13 @@ function ensureOverlay() {
   });
   overlay.addEventListener("click", onOverlayClick);
   document.addEventListener("keydown", onKeyDown, true);
+  // 面板是全屏的，所有指针/滚轮事件都在这里吃掉，别让 ComfyUI 画布
+  // 把「在编辑器里的一次点击」当成画布操作（会拖节点、取消选中，甚至把弹层顶掉）。
+  for (const name of ["pointerdown", "pointerup", "mousedown", "mouseup", "wheel", "contextmenu"]) {
+    overlay.addEventListener(name, (event) => event.stopPropagation(), {
+      passive: name === "wheel",
+    });
+  }
 
   return overlay;
 }
@@ -357,15 +411,45 @@ export function openEditor() {
   ensureOverlay();
   if (!frameLoaded) {
     loadFrame(HOME_URL);
+  } else {
+    // iframe 里可能是部署扩展之前加载的旧页面：打开时再补一次注入
+    ensureExtScript();
   }
   restoreFocus = document.activeElement;
   overlay.classList.add("is-open");
   overlay.querySelector('[data-act="close"]')?.focus();
 }
 
+/** 关掉弹层时把里面的播放停掉：iframe 是常驻的，只隐藏的话声音还在放 */
+function pauseFrame() {
+  // 1) 直接暂停 DOM 里的媒体（同源 iframe，拿得到 document）
+  try {
+    const doc = frame?.contentWindow?.document;
+    doc?.querySelectorAll("video,audio").forEach((media) => {
+      try {
+        media.pause();
+      } catch {
+        /* 有些元素不允许 pause */
+      }
+    });
+  } catch {
+    /* iframe 还没加载好 */
+  }
+  // 2) 通知编辑器把「播放状态」一起停掉，否则再打开会带着播放中状态跳一下
+  try {
+    frame?.contentWindow?.postMessage(
+      { type: "yuancut:command", command: "pause" },
+      "*",
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
 /** 关闭编辑器；iframe 保留，下次打开立即恢复上次的编辑状态 */
 export function closeEditor() {
   if (!overlay) return;
+  pauseFrame();
   overlay.classList.remove("is-open");
   if (restoreFocus?.focus) {
     try {
@@ -376,8 +460,6 @@ export function closeEditor() {
   }
   restoreFocus = null;
 }
-
-/** Python 侧的 NODE_DISPLAY_NAME_MAPPINGS 需重启 ComfyUI 才生效，这里兜一层即时生效 */
 function applyTitle(node) {
   if (!node.title || node.title === NODE_CLASS) node.title = "YuanCut 视频编辑器";
 }
@@ -394,7 +476,21 @@ function buildNodeUI(node) {
     <div class="yuancut-node-hint">${TEXT.nodeHint}</div>
     <button type="button" class="yuancut-node-open">${TEXT.open}</button>`;
 
+  const hint = box.querySelector(".yuancut-node-hint");
   const button = box.querySelector(".yuancut-node-open");
+
+  // 关键布局直接写在元素上：万一外部样式表还没注入，按钮也不会被挤出节点（首帧就完整）
+  box.style.cssText =
+    "display:flex;flex-direction:column;gap:8px;padding:2px;box-sizing:border-box;width:100%;";
+  if (hint) {
+    hint.style.cssText =
+      "font-size:11px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+  }
+  button.style.cssText =
+    "padding:8px 12px;border:1px solid rgba(0,157,255,0.55);border-radius:8px;" +
+    "background:#009dff;color:#fff;font-size:13px;font-weight:600;cursor:pointer;" +
+    "font-family:inherit;line-height:1.2;width:100%;box-sizing:border-box;";
+
   button.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -427,21 +523,33 @@ function buildNodeUI(node) {
     options.push({ content: TEXT.menu, callback: () => openEditor() });
   };
 
-  // 节点最小尺寸：保证提示文字与按钮完整落在节点内
+  // 节点最小尺寸：创建时立刻按内容算好。
+  // 以前靠 setTimeout(0/150) 补尺寸，头一两百毫秒按钮被裁在节点外面（只看到文字）。
   const MIN_WIDTH = 300;
   const MIN_HEIGHT = 150;
   const ensureSize = () => {
-    if (!node.size || node.size.length < 2 || typeof node.size[0] !== "number") return;
-    const width = node.size[0] || 0;
-    const height = node.size[1] || 0;
-    if (width >= MIN_WIDTH && height >= MIN_HEIGHT) return;
-    node.setSize([Math.max(width, MIN_WIDTH), Math.max(height, MIN_HEIGHT)]);
+    if (!node.size || typeof node.size[0] !== "number") return;
+
+    let needWidth = MIN_WIDTH;
+    let needHeight = MIN_HEIGHT;
+    if (typeof node.computeSize === "function") {
+      const computed = node.computeSize();
+      if (Array.isArray(computed)) {
+        needWidth = Math.max(needWidth, Number(computed[0]) || 0);
+        needHeight = Math.max(needHeight, Number(computed[1]) || 0);
+      }
+    }
+
+    const width = Math.max(node.size[0] || 0, needWidth);
+    const height = Math.max(node.size[1] || 0, needHeight);
+    if (Math.abs(width - node.size[0]) < 0.5 && Math.abs(height - node.size[1]) < 0.5) return;
+    node.setSize([width, height]);
     app.graph?.setDirtyCanvas?.(true, true);
   };
 
+  injectStyle();
   ensureSize();
-  setTimeout(ensureSize, 0);
-  setTimeout(ensureSize, 150);
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(ensureSize);
 
   const previousOnAdded = node.onAdded;
   node.onAdded = function (...args) {
