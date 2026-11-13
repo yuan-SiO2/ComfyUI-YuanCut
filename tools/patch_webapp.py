@@ -6075,7 +6075,7 @@ write(
     SRC / "hooks" / "use-asset-marquee.ts",
     '''"use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAssetSelectionStore } from "@/stores/asset-selection-store";
 
 export type MarqueePos = { x: number; y: number };
@@ -6083,10 +6083,13 @@ export type MarqueePos = { x: number; y: number };
 const ITEM_SELECTOR = "[data-asset-id]";
 // 少于这个像素就当点击，不算框选
 const MIN_DRAG_SIZE = 3;
+// 距面板上下边缘多少像素开始自动滚动，以及每帧滚多少
+const EDGE_SCROLL_ZONE = 48;
+const EDGE_SCROLL_STEP = 14;
 
 /**
- * 素材面板框选：在空白处按下并拖出选框，选中与选框相交的素材。
- * 选中结果同时写进 DOM 的 data-selected，列表用 CSS 高亮即可。
+ * 素材面板框选：在空白处按下拖出选框，拖动过程中实时更新选中；
+ * 拖到面板上下边缘会自动滚动，素材多时可以一路往上/往下继续选。
  */
 export function useAssetMarquee({
 	containerRef,
@@ -6098,6 +6101,7 @@ export function useAssetMarquee({
 	const [active, setActive] = useState(false);
 	const [startPos, setStartPos] = useState<MarqueePos | null>(null);
 	const [currentPos, setCurrentPos] = useState<MarqueePos | null>(null);
+	const latestPos = useRef<MarqueePos | null>(null);
 
 	const applySelection = useCallback(
 		({ ids }: { ids: string[] }) => {
@@ -6123,61 +6127,130 @@ export function useAssetMarquee({
 		return () => applySelection({ ids: [] });
 	}, [applySelection]);
 
-	const handleMouseDown = useCallback((event: React.MouseEvent) => {
-		if (event.button !== 0) return;
-		const target = event.target as HTMLElement;
-		// 点在素材上、按钮上或滚动条上时不启动框选
-		if (target.closest(ITEM_SELECTOR) || target.closest("button")) return;
-		event.preventDefault();
-		setActive(true);
-		setStartPos({ x: event.clientX, y: event.clientY });
-		setCurrentPos({ x: event.clientX, y: event.clientY });
-	}, []);
+	const getScroller = useCallback((): HTMLElement | null => {
+		const container = containerRef.current;
+		if (!container) return null;
+		return container.querySelector<HTMLElement>(".overflow-y-auto") ?? container;
+	}, [containerRef]);
+
+	// 命中测试：选框和素材卡片在屏幕上相交就算选中
+	const collectIds = useCallback(
+		({ from, to }: { from: MarqueePos; to: MarqueePos }) => {
+			const container = containerRef.current;
+			if (!container) return [];
+			const left = Math.min(from.x, to.x);
+			const right = Math.max(from.x, to.x);
+			const top = Math.min(from.y, to.y);
+			const bottom = Math.max(from.y, to.y);
+			return Array.from(container.querySelectorAll<HTMLElement>(ITEM_SELECTOR))
+				.filter((node) => {
+					const box = node.getBoundingClientRect();
+					return (
+						box.left < right &&
+						box.right > left &&
+						box.top < bottom &&
+						box.bottom > top
+					);
+				})
+				.map((node) => node.dataset.assetId)
+				.filter((id): id is string => Boolean(id));
+		},
+		[containerRef],
+	);
+
+	const handleMouseDown = useCallback(
+		(event: React.MouseEvent) => {
+			if (event.button !== 0) return;
+			const target = event.target as HTMLElement;
+			// 点在素材上、按钮上时不启动框选
+			if (target.closest(ITEM_SELECTOR) || target.closest("button")) return;
+			event.preventDefault();
+			const pos = { x: event.clientX, y: event.clientY };
+			latestPos.current = pos;
+			setActive(true);
+			setStartPos(pos);
+			setCurrentPos(pos);
+			applySelection({ ids: [] });
+		},
+		[applySelection],
+	);
 
 	useEffect(() => {
 		if (!active) return;
 
-		const handleMove = (event: MouseEvent) => {
-			setCurrentPos({ x: event.clientX, y: event.clientY });
+		let frame = 0;
+		let scrollStep = 0;
+
+		const syncSelection = () => {
+			const start = startPos;
+			const current = latestPos.current;
+			if (!start || !current) return;
+			const moved =
+				Math.abs(current.x - start.x) > MIN_DRAG_SIZE ||
+				Math.abs(current.y - start.y) > MIN_DRAG_SIZE;
+			applySelection({
+				ids: moved ? collectIds({ from: start, to: current }) : [],
+			});
 		};
 
-		const handleUp = (event: MouseEvent) => {
-			const container = containerRef.current;
-			const start = startPos;
-			if (container && start) {
-				const left = Math.min(start.x, event.clientX);
-				const right = Math.max(start.x, event.clientX);
-				const top = Math.min(start.y, event.clientY);
-				const bottom = Math.max(start.y, event.clientY);
-				const isDrag = right - left > MIN_DRAG_SIZE || bottom - top > MIN_DRAG_SIZE;
-				const ids = isDrag
-					? Array.from(container.querySelectorAll<HTMLElement>(ITEM_SELECTOR))
-							.filter((node) => {
-								const box = node.getBoundingClientRect();
-								return (
-									box.left < right &&
-									box.right > left &&
-									box.top < bottom &&
-									box.bottom > top
-								);
-							})
-							.map((node) => node.dataset.assetId)
-							.filter((id): id is string => Boolean(id))
-					: [];
-				applySelection({ ids });
+		const tick = () => {
+			const scroller = getScroller();
+			if (scrollStep !== 0 && scroller) {
+				const before = scroller.scrollTop;
+				scroller.scrollTop = before + scrollStep;
+				if (scroller.scrollTop !== before) {
+					// 滚动后卡片位置变了，重新算一次命中
+					syncSelection();
+				}
 			}
+			frame = requestAnimationFrame(tick);
+		};
+
+		const handleMove = (event: MouseEvent) => {
+			if (event.buttons === 0) {
+				// 鼠标已经在窗口外松开、收不到 mouseup 时兜底收尾
+				scrollStep = 0;
+				setActive(false);
+				return;
+			}
+			const pos = { x: event.clientX, y: event.clientY };
+			latestPos.current = pos;
+			setCurrentPos(pos);
+			syncSelection();
+
+			const scroller = getScroller();
+			if (!scroller) {
+				scrollStep = 0;
+				return;
+			}
+			const box = scroller.getBoundingClientRect();
+			if (event.clientY < box.top + EDGE_SCROLL_ZONE) {
+				scrollStep = -EDGE_SCROLL_STEP;
+			} else if (event.clientY > box.bottom - EDGE_SCROLL_ZONE) {
+				scrollStep = EDGE_SCROLL_STEP;
+			} else {
+				scrollStep = 0;
+			}
+		};
+
+		const handleUp = () => {
+			syncSelection();
+			scrollStep = 0;
 			setActive(false);
 			setStartPos(null);
 			setCurrentPos(null);
+			latestPos.current = null;
 		};
 
 		window.addEventListener("mousemove", handleMove);
 		window.addEventListener("mouseup", handleUp);
+		frame = requestAnimationFrame(tick);
 		return () => {
 			window.removeEventListener("mousemove", handleMove);
 			window.removeEventListener("mouseup", handleUp);
+			cancelAnimationFrame(frame);
 		};
-	}, [active, startPos, containerRef, applySelection]);
+	}, [active, startPos, applySelection, collectIds, getScroller]);
 
 	return {
 		active,
@@ -7004,7 +7077,104 @@ for _panel in ("audio-properties.tsx", "video-properties.tsx"):
         required=False,
     )
 
-print("Done. Next: pnpm install && pnpm exec next build (see tools/build_ui.sh)")
+# ------------------------------------------------ 拖素材到时间轴不再凭空新建轨道
+# 上游在没有「空闲的兼容轨道」时会新建一条轨道，于是往已经有内容的主轨道上拖，
+# 就会出现「多出一条视频轨」。这里改成：先追加到最后一条兼容轨道的末尾，
+# 真的没有任何兼容轨道时才新建。
+p = SRC / "lib" / "timeline" / "drop-utils.ts"
+patch(
+    p,
+    '''function getMainTrackIndex({ tracks }: { tracks: TimelineTrack[] }): number {
+\treturn tracks.findIndex((track) => isMainTrack(track));
+}''',
+    '''function getMainTrackIndex({ tracks }: { tracks: TimelineTrack[] }): number {
+\treturn tracks.findIndex((track) => isMainTrack(track));
+}
+
+/** 最后一条能放下该类型元素的轨道；没有则返回 null */
+function findLastCompatibleTrackIndex({
+\telementType,
+\ttracks,
+}: {
+\telementType: ElementType;
+\ttracks: TimelineTrack[];
+}): number | null {
+\tlet found: number | null = null;
+\tfor (let index = 0; index < tracks.length; index++) {
+\t\tif (isCompatible({ elementType, trackType: tracks[index].type })) {
+\t\t\tfound = index;
+\t\t}
+\t}
+\treturn found;
+}''',
+)
+patch(
+    p,
+    '''\t\tconst isAboveAllTracks = mouseY < 0;
+
+\t\tif (elementType === "audio") {
+\t\t\treturn {
+\t\t\t\ttrackIndex: tracks.length,
+\t\t\t\tisNewTrack: true,
+\t\t\t\tinsertPosition: "below",
+\t\t\t\txPosition,
+\t\t\t};
+\t\t}
+
+\t\tif (isAboveAllTracks) {''',
+    '''\t\tconst isAboveAllTracks = mouseY < 0;
+
+\t\tif (isAboveAllTracks) {''',
+)
+patch(
+    p,
+    '''\t\treturn {
+\t\t\ttrackIndex: Math.max(0, mainTrackIndex),
+\t\t\tisNewTrack: true,
+\t\t\tinsertPosition: "above",
+\t\t\txPosition,
+\t\t};
+\t}''',
+    '''\t\t// 没有空闲的兼容轨道：追加到最后一条兼容轨道的末尾，而不是新建轨道
+\t\tconst fallbackIndex = findLastCompatibleTrackIndex({ elementType, tracks });
+\t\tconst fallbackTrack =
+\t\t\tfallbackIndex === null ? null : tracks[fallbackIndex];
+\t\tif (fallbackTrack) {
+\t\t\tconst trackEnd = fallbackTrack.elements.reduce(
+\t\t\t\t(max, element) => Math.max(max, element.startTime + element.duration),
+\t\t\t\t0,
+\t\t\t);
+\t\t\treturn {
+\t\t\t\ttrackIndex: fallbackIndex as number,
+\t\t\t\tisNewTrack: false,
+\t\t\t\tinsertPosition: null,
+\t\t\t\txPosition: enforceMainTrackStart({
+\t\t\t\t\ttracks,
+\t\t\t\t\ttargetTrackId: fallbackTrack.id,
+\t\t\t\t\trequestedStartTime: Math.max(xPosition, trackEnd),
+\t\t\t\t\texcludeElementId,
+\t\t\t\t}),
+\t\t\t};
+\t\t}
+
+\t\tif (elementType === "audio") {
+\t\t\treturn {
+\t\t\t\ttrackIndex: tracks.length,
+\t\t\t\tisNewTrack: true,
+\t\t\t\tinsertPosition: "below",
+\t\t\t\txPosition,
+\t\t\t};
+\t\t}
+
+\t\treturn {
+\t\t\ttrackIndex: Math.max(0, mainTrackIndex),
+\t\t\tisNewTrack: true,
+\t\t\tinsertPosition: "above",
+\t\t\txPosition,
+\t\t};
+\t}''',
+)
+
 
 
 # ------------------------------------------------------------ 人声美化面板
@@ -9113,6 +9283,27 @@ function collectMediaAudioClip({""",
         raise SystemExit(f"视频音轨替换没打全：{AUDIO_LIB}")
     AUDIO_LIB.write_text(_al, encoding="utf-8")
     print(f"  patched {AUDIO_LIB.relative_to(ROOT)} (视频用人声美化后的音轨)")
+
+
+# 视频片段的音量要进预览：素材音轨走同一套 AudioClip，原来 volume 写死 1，
+# 于是「面板上调了音量，播放时一点没变」，只有导出听得出差别。
+_al = AUDIO_LIB.read_text(encoding="utf-8")
+if "volume: element.volume ?? 1," not in _al:
+    _video_volume_old = (
+        "\t\t\t\t\t\tvolume: 1,\n"
+        "\t\t\t\t\t\tmuted,\n"
+        "\t\t\t\t\t\tplaybackRate: element.playbackRate ?? 1,\n"
+        "\t\t\t\t\t\treversed: element.reversed ?? false,\n"
+    )
+    if _al.count(_video_volume_old) != 1:
+        raise SystemExit(f"视频音量锚点不对：{AUDIO_LIB}")
+    _al = _al.replace(
+        _video_volume_old,
+        _video_volume_old.replace("volume: 1,", "volume: element.volume ?? 1,", 1),
+        1,
+    )
+    AUDIO_LIB.write_text(_al, encoding="utf-8")
+    print(f"  patched {AUDIO_LIB.relative_to(ROOT)} (视频音量进预览)")
 
 
 # --------------------------- 选中框 / 拖动命中：同样以画布为适配基准
@@ -11855,3 +12046,266 @@ if "selectedTemplate.templateName" in _cv and _CARD in _cv:
     print(f"  patched {CAPTIONS_VIEW.relative_to(ROOT)} (去掉模板预览)")
 elif _CARD not in _cv and "selectedTemplate.templateName" in _cv:
     raise SystemExit("字幕模板预览块锚点没匹配")
+
+# ------------------------------------------------ 人声美化：多选/大批量也稳
+# 42 片段一起框选时，原来逐个串行探测音轨、任何一个探测失败或超时都会让入口出不来；
+# 处理阶段任何一个素材报错还会中断整批。这里改成并行探测 + 单个失败不影响其余。
+replace_between(
+    VIDEO_PROPERTIES,
+    '\tconst probeAssetIds = videoRefs.map((ref) => ref.element.mediaId).join("|");',
+    "\t// 勾选框反映整组状态：全部勾上才算勾上",
+    r'''	const probeAssetIds = Array.from(
+		new Set(videoRefs.map((ref) => ref.element.mediaId)),
+	).join("|");
+	useEffect(() => {
+		setAssetHasAudio(null);
+		const ids = probeAssetIds.split("|").filter(Boolean);
+		if (ids.length === 0) {
+			setAssetHasAudio(false);
+			return;
+		}
+		let cancelled = false;
+		void (async () => {
+			const assets = editor.media.getAssets();
+			// 并行探测：几十个片段也不会把面板卡住，单个失败不影响整体
+			const results = await Promise.all(
+				ids.map(async (id) => {
+					const media = assets.find((asset) => asset.id === id) ?? null;
+					const pending = probeMediaHasAudio({ media });
+					if (!pending) return null;
+					try {
+						return await pending;
+					} catch {
+						return null;
+					}
+				}),
+			);
+			if (cancelled) return;
+			if (results.some((value) => value === true)) {
+				setAssetHasAudio(true);
+				return;
+			}
+			// 只有全部明确「没有音轨」才隐藏入口；探测不出来时先放行，处理阶段会再判断
+			setAssetHasAudio(
+				results.every((value) => value === false) ? false : true,
+			);
+		})();
+		return () => {
+			cancelled = true;
+		};
+	}, [editor, probeAssetIds]);
+
+''',
+    marker="并行探测",
+)
+
+patch_text(
+    VIDEO_PROPERTIES,
+    "assetHasAudio !== false;",
+    [("\t\tassetHasAudio === true;", "\t\tassetHasAudio !== false;", 1)],
+)
+patch_text(
+    VIDEO_PROPERTIES,
+    "let failed = 0;",
+    [("\t\tlet skipped = 0;", "\t\tlet skipped = 0;\n\t\tlet failed = 0;", 1)],
+)
+patch_text(
+    VIDEO_PROPERTIES,
+    "hasAudio = (await probeMediaHasAudio({ media: source })) ?? false;",
+    [
+        (
+            "\t\t\t\tconst hasAudio = await probeMediaHasAudio({ media: source });\n"
+            "\t\t\t\tif (!hasAudio) {",
+            "\t\t\t\tlet hasAudio = false;\n"
+            "\t\t\t\ttry {\n"
+            "\t\t\t\t\thasAudio = (await probeMediaHasAudio({ media: source })) ?? false;\n"
+            "\t\t\t\t} catch {\n"
+            "\t\t\t\t\thasAudio = false;\n"
+            "\t\t\t\t}\n"
+            "\t\t\t\tif (!hasAudio) {",
+            1,
+        ),
+    ],
+)
+patch_text(
+    VIDEO_PROPERTIES,
+    "// 单个素材失败不影响其它素材",
+    [
+        (
+            "\t\t\t\tconst result = await applyVocalBeautify({\n"
+            "\t\t\t\t\teditor,\n"
+            "\t\t\t\t\tsource,\n"
+            "\t\t\t\t\tstrength: beautifyStrength,\n"
+            "\t\t\t\t\tonProgress: (state) => {\n"
+            "\t\t\t\t\t\tsetBeautifyStatus(`${prefix}${describeVocalBeautify(state)}`);\n"
+            "\t\t\t\t\t\tsetBeautifyProgress(\n"
+            "\t\t\t\t\t\t\t((index - 1) + (state.progress ?? 0)) / groups.size,\n"
+            "\t\t\t\t\t\t);\n"
+            "\t\t\t\t\t},\n"
+            "\t\t\t\t});",
+            "\t\t\t\tconst result = await applyVocalBeautify({\n"
+            "\t\t\t\t\teditor,\n"
+            "\t\t\t\t\tsource,\n"
+            "\t\t\t\t\tstrength: beautifyStrength,\n"
+            "\t\t\t\t\tonProgress: (state) => {\n"
+            "\t\t\t\t\t\tsetBeautifyStatus(`${prefix}${describeVocalBeautify(state)}`);\n"
+            "\t\t\t\t\t\tsetBeautifyProgress(\n"
+            "\t\t\t\t\t\t\t((index - 1) + (state.progress ?? 0)) / groups.size,\n"
+            "\t\t\t\t\t\t);\n"
+            "\t\t\t\t\t},\n"
+            "\t\t\t\t}).catch(() => null);\n"
+            "\t\t\t\tif (!result) {\n"
+            "\t\t\t\t\t// 单个素材失败不影响其它素材\n"
+            "\t\t\t\t\tfailed += refs.length;\n"
+            "\t\t\t\t\tcontinue;\n"
+            "\t\t\t\t}",
+            1,
+        ),
+    ],
+)
+patch_text(
+    VIDEO_PROPERTIES,
+    "个处理失败",
+    [
+        (
+            "\t\t\t\tskipped > 0\n"
+            "\t\t\t\t\t? `已处理 ${processed} 个片段，${skipped} 个因没有音轨跳过`\n"
+            "\t\t\t\t\t: `已处理 ${processed} 个片段：画面不变，声音换成处理后的音轨`,",
+            "\t\t\t\t[\n"
+            "\t\t\t\t\t`已处理 ${processed} 个片段：画面不变，声音换成处理后的音轨`,\n"
+            "\t\t\t\t\tskipped > 0 ? `${skipped} 个因没有音轨跳过` : \"\",\n"
+            "\t\t\t\t\tfailed > 0 ? `${failed} 个处理失败` : \"\",\n"
+            "\t\t\t\t]\n"
+            "\t\t\t\t\t.filter(Boolean)\n"
+            "\t\t\t\t\t.join(\"；\"),",
+            1,
+        ),
+    ],
+)
+
+patch_text(
+    VIDEO_PROPERTIES,
+    "const failureReasons: string[] = [];",
+    [
+        (
+            "\t\tlet failed = 0;",
+            "\t\tlet failed = 0;\n"
+            "\t\t// 只留第一条失败原因：面板上要能看出为什么失败，而不是只有一个数字\n"
+            "\t\tconst failureReasons: string[] = [];",
+            1,
+        ),
+    ],
+)
+patch_text(
+    VIDEO_PROPERTIES,
+    "failureReasons.push(",
+    [
+        (
+            "\t\t\t\t}).catch(() => null);",
+            "\t\t\t\t}).catch((error) => {\n"
+            "\t\t\t\t\tif (failureReasons.length === 0) {\n"
+            "\t\t\t\t\t\t// worker 的 stderr 是多行，压成一行再截断，免得撑开面板\n"
+            "\t\t\t\t\t\tfailureReasons.push(\n"
+            "\t\t\t\t\t\t\tString((error as Error)?.message ?? error)\n"
+            "\t\t\t\t\t\t\t\t.replace(/\\s+/g, \" \")\n"
+            "\t\t\t\t\t\t\t\t.slice(0, 120),\n"
+            "\t\t\t\t\t\t);\n"
+            "\t\t\t\t\t}\n"
+            "\t\t\t\t\treturn null;\n"
+            "\t\t\t\t});",
+            1,
+        ),
+    ],
+)
+patch_text(
+    VIDEO_PROPERTIES,
+    "（首个：${failureReasons[0]}）",
+    [
+        (
+            "\t\t\t\t\tfailed > 0 ? `${failed} 个处理失败` : \"\",",
+            "\t\t\t\t\tfailed > 0\n"
+            "\t\t\t\t\t\t? `${failed} 个处理失败${\n"
+            "\t\t\t\t\t\t\t\tfailureReasons.length > 0 ? `（首个：${failureReasons[0]}）` : \"\"\n"
+            "\t\t\t\t\t\t\t}` : \"\",",
+            1,
+        ),
+    ],
+)
+patch_text(
+    VIDEO_PROPERTIES,
+    "失败：${detail}",
+    [
+        (
+            "\t\t\tsetBeautifyStatus(`失败：${(error as Error).message}`);",
+            "\t\t\tconst detail = String((error as Error)?.message ?? error)\n"
+            "\t\t\t\t.replace(/\\s+/g, \" \")\n"
+            "\t\t\t\t.slice(0, 200);\n"
+            "\t\t\tsetBeautifyStatus(`失败：${detail}`);",
+            1,
+        ),
+    ],
+)
+
+# ------------------------------------------------ 统一响度（按实测 LUFS 对齐）
+# 音量滑块只能「一起调到同一个百分比」，可各段原始声音大小本来就不同；
+# 要做「响度统一」必须先测出每段的实际响度再分别补偿。测量放服务端 ffmpeg 做
+# （loudnorm 单遍），前端只负责算增益、写回 volume。
+_SHIM_DIR = Path(__file__).resolve().parent / "webapp"
+for _target, _name in (
+    (SRC / "lib" / "audio" / "loudness.ts", "loudness.ts"),
+    (VOICE_PANEL_DIR / "loudness-match-row.tsx", "loudness-match-row.tsx"),
+):
+    _source = _SHIM_DIR / _name
+    if not _source.is_file():
+        raise SystemExit(f"缺少模板文件：{_source}")
+    _text = _source.read_text(encoding="utf-8")
+    if not _target.is_file() or _target.read_text(encoding="utf-8") != _text:
+        _target.parent.mkdir(parents=True, exist_ok=True)
+        _target.write_text(_text, encoding="utf-8")
+        print(f"  wrote   {_target.relative_to(ROOT)} (统一响度)")
+
+for _panel in (VIDEO_PROPERTIES, AUDIO_PROPERTIES):
+    patch_text(
+        _panel,
+        'import { LoudnessMatchRow } from "./loudness-match-row";',
+        [
+            (
+                'import { VocalBeautifyRow } from "./vocal-beautify-row";',
+                'import { VocalBeautifyRow } from "./vocal-beautify-row";\n'
+                'import { LoudnessMatchRow } from "./loudness-match-row";',
+                1,
+            ),
+        ],
+    )
+
+patch_text(
+    VIDEO_PROPERTIES,
+    "<LoudnessMatchRow refs={videoRefs} />",
+    [
+        (
+            '\t\t\t\t\t<PropertyGroup title="音量" collapsible={false}>\n'
+            '\t\t\t\t\t\t<div className="space-y-6">\n',
+            '\t\t\t\t\t<PropertyGroup title="音量" collapsible={false}>\n'
+            '\t\t\t\t\t\t<div className="space-y-6">\n'
+            "\t\t\t\t\t\t\t<LoudnessMatchRow refs={videoRefs} />\n",
+            1,
+        ),
+    ],
+)
+patch_text(
+    AUDIO_PROPERTIES,
+    "<LoudnessMatchRow refs={elementRefs} />",
+    [
+        (
+            '\t\t\t\t<PropertyGroup title={t("Volume")} hasBorderTop={false} collapsible={false}>\n'
+            '\t\t\t\t\t<div className="space-y-6">\n',
+            '\t\t\t\t<PropertyGroup title={t("Volume")} hasBorderTop={false} collapsible={false}>\n'
+            '\t\t\t\t\t<div className="space-y-6">\n'
+            "\t\t\t\t\t\t<LoudnessMatchRow refs={elementRefs} />\n",
+            1,
+        ),
+    ],
+)
+
+
+print("Done. Next: pnpm install && pnpm exec next build (see tools/build_ui.sh)")

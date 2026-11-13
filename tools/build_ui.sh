@@ -26,15 +26,24 @@ bash "$HERE/tools/sonic/build_sonic_wasm.sh"
 
 echo "==> applying ComfyUI /yuancut patches"
 YUANCUT_WORK="$WORK/yuancut" python3 "$HERE/tools/patch_webapp.py"
+echo "==> applying caption text cleanup patch"
+YUANCUT_WORK="$WORK/yuancut" python3 "$HERE/tools/patch_captions.py"
 
 echo "==> applying time-stretch / tempo patches"
 YUANCUT_WORK="$WORK/yuancut" python3 "$HERE/tools/patch_time_stretch.py"
 YUANCUT_WORK="$WORK/yuancut" python3 "$HERE/tools/patch_sonic_player.py"
 
 echo "==> installing dependencies (pnpm)"
+# 上游仓库原本用 bun，没有 pnpm-workspace.yaml；pnpm 11 找不到 workspace 定义会直接报
+# ERR_PNPM_WORKSPACE_PKG_NOT_FOUND（@cutia/env 之类的 workspace 依赖解析不到）。
+if [ ! -f "$WORK/yuancut/pnpm-workspace.yaml" ]; then
+  printf 'packages:\n  - "apps/*"\n  - "packages/*"\n' > "$WORK/yuancut/pnpm-workspace.yaml"
+fi
 # --ignore-scripts: sharp / onnxruntime postinstalls are not needed for a static
 # export and can fail on machines without npm; nothing in the tree needs them.
-(cd "$WORK/yuancut" && pnpm install --reporter=append-only --ignore-scripts)
+# verify-deps-before-run=false: 避免 pnpm exec 时又触发一次自动安装。
+(cd "$WORK/yuancut" && PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false \
+  pnpm install --reporter=append-only --ignore-scripts)
 
 echo "==> building static export"
 (
@@ -42,6 +51,7 @@ echo "==> building static export"
   NEXT_TELEMETRY_DISABLED=1 \
   UPSTASH_REDIS_REST_URL="http://127.0.0.1:8079" \
   UPSTASH_REDIS_REST_TOKEN="build-only" \
+  PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false \
   pnpm exec next build
 )
 

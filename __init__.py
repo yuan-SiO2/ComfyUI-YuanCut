@@ -231,6 +231,11 @@ try:
     from . import yuancut_transcribe
 
     yuancut_transcribe.register_routes(_routes)
+    # 响度测量：给「统一响度」提供每个片段的实测 LUFS
+    from . import yuancut_loudness
+
+    yuancut_loudness.register_routes(_routes)
+
 
     # 可选扩展：接口由扩展自己注册，静态文件走 /yuancut/ext/<path>
     _routes.get("/yuancut/ext/{path:.*}")(_ext.handle_static)

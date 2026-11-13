@@ -254,6 +254,21 @@ def dsp_enhance(x: np.ndarray, strength: float, makeup: float | None = None) -> 
 
 # ---------------------------------------------------------------------- 主流程
 
+def _as_stereo(block: np.ndarray) -> np.ndarray:
+    """把任意声道布局的块规整成 soundfile 能写的 (N, 2)。
+
+    soundfile 在 channels>1 时即使 always_2d=False 也会返回 (N, C)；
+    这里再套一次 [:, None] 就会变成 (N, C, 2) 被拒。
+    """
+    if block.ndim == 1:
+        return np.repeat(block[:, None], 2, axis=1)
+    if block.shape[1] == 2:
+        return block
+    if block.shape[1] == 1:
+        return np.repeat(block, 2, axis=1)
+    return block[:, :2]
+
+
 def normalize_output(
     path: str, progress_path: str | None, target_rms: float | None = None
 ) -> None:
@@ -274,6 +289,8 @@ def normalize_output(
             block = source.read(frame * 200, dtype="float32", always_2d=False)
             if block.size == 0:
                 break
+            if block.ndim > 1:
+                block = block.mean(axis=1)
             count = block.size // frame
             if count:
                 chunked = block[: count * frame].reshape(count, frame)
@@ -289,38 +306,31 @@ def normalize_output(
         return
 
     temporary = f"{path}.norm"
-    with sf.SoundFile(path, mode="r") as source, sf.SoundFile(
-        temporary, mode="w", samplerate=SR, channels=2, subtype="PCM_24", format="WAV"
-    ) as target:
-        peak = 0.0
+    # 先扫一遍求峰值：放大后再写 PCM_24 会在 1.0 处硬削波（听感就是破音），
+    # 所以最终增益一次算好、一遍写出，不做「先写再压」的两遍。
+    reference_peak = 0.0
+    with sf.SoundFile(path, mode="r") as source:
         while True:
             block = source.read(1 << 18, dtype="float32", always_2d=False)
             if block.size == 0:
                 break
-            scaled = (block * gain).astype(np.float32)
-            peak = max(peak, float(np.max(np.abs(scaled))))
-            target.write(np.repeat(scaled[:, None], 2, axis=1))
-    # 归一化后可能顶到 0 dBFS，超过 -1 dBFS 再整体压一下
-    if peak > 10 ** (-1.0 / 20.0) and peak > 0:
-        scale = 10 ** (-1.0 / 20.0) / peak
-        with sf.SoundFile(temporary, mode="r") as source, sf.SoundFile(
-            f"{temporary}.lim",
-            mode="w",
-            samplerate=SR,
-            channels=2,
-            subtype="PCM_24",
-            format="WAV",
-        ) as target:
-            while True:
-                block = source.read(1 << 18, dtype="float32", always_2d=False)
-                if block.size == 0:
-                    break
-                target.write(
-                    np.repeat((block * scale).astype(np.float32)[:, None], 2, axis=1)
-                )
-        os.replace(f"{temporary}.lim", temporary)
+            reference_peak = max(reference_peak, float(np.max(np.abs(block))))
+    ceiling = 10 ** (-1.0 / 20.0)
+    total_gain = gain
+    if reference_peak > 0 and reference_peak * total_gain > ceiling:
+        total_gain = ceiling / reference_peak
+    with sf.SoundFile(path, mode="r") as source, sf.SoundFile(
+        temporary, mode="w", samplerate=SR, channels=2, subtype="PCM_24", format="WAV"
+    ) as target:
+        while True:
+            block = source.read(1 << 18, dtype="float32", always_2d=False)
+            if block.size == 0:
+                break
+            target.write(_as_stereo((block * total_gain).astype(np.float32)))
     os.replace(temporary, path)
-    log(f"[voice] 输出响度校正 x{gain:.2f}")
+    log(f"[voice] 输出响度校正 x{total_gain:.2f}")
+
+
 def run(
     *,
     input_path: str,
